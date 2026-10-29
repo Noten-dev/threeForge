@@ -357,12 +357,148 @@ renderer.dispose();
 
 ---
 
+## 8.5. Тени (v2.7 Shadow Overhaul)
+
+### Пресет качества одним вызовом
+
+```js
+import { applyShadowQuality } from './threeforge/threeforge-v2_6_0.js';
+
+// на загрузке уровня (смена каскадов/тапов recompiles шейдеры — не зовите в бою):
+applyShadowQuality('ultra', { rig: lights, lights: lightManager });
+// 'low' | 'medium' | 'high' (= прежнее поведение) | 'ultra' — или свой объект-пресет
+```
+
+Пресет настраивает: каскады CSM, Vogel-тапы PCF, soft-режим, размеры карт
+солнца/луны/слотов `LightManager`, бюджет и частоту обновлений.
+
+### Ручная настройка
+
+```js
+import { setSunCascadeCount, setShadowQuality } from './threeforge/threeforge-v2_6_0.js';
+
+setSunCascadeCount(4);                       // 1..4 каскада (ДО первого рендера!)
+rig.sun.shadow.setSplitLambda(0.6);          // 0 = log-сплиты, 1 = uniform
+rig.sun.shadow.setCascadeTiles([2, 1, 1, 1]); // ближний каскад вдвое детальнее
+rig.sun.shadow.setCascadeFade(0.15);         // шире бленд между каскадами
+
+setShadowQuality({
+  taps: 16,                                  // Vogel-тапов PCF (дефолт 12)
+  soft: { mix: 0.6, depthGrowth: 0.4, radius: 3 }, // мягкие тени (×2 сэмплинга)
+  fadeAllLights: true                        // туманный фейд для dir/spot/point
+});
+```
+
+### Лунные тени
+
+```js
+const rig = createLightRig({
+  scene, camera,
+  moonShadow: { mapSize: 1024, range: 60 },  // castShadow включён сразу — без
+});                                          // рекомпиляций в рантайме
+// ночью SunCycle сам включает shadow-проход луны и следит фрустумом за камерой
+```
+
+### Бюджет обновлений (много факелов/ламп)
+
+```js
+const lights = new LightManager({
+  scene, camera, maxPointLights: 8, pointShadowSlots: 2,
+  shadowBudget: 1,   // не более 1 рендера теневой карты на кадр (round-robin)
+  shadowRate: 10     // статичным источникам хватает 10 Гц
+});
+lights.add(torch, { shadow: true });                  // унаследует 10 Гц
+lights.add(playerLamp, { shadow: true, shadowRate: 0 }); // каждый кадр
+```
+
+Первый рендер карты источника — всегда вне бюджета (иначе чёрные тени).
+Ночью `SunCycle` плавно уводит `sun.shadow.intensity` в 0 — застывшая карта
+заката больше не рисуется на ночной сцене.
+
+### Отладка
+
+```js
+import { SunShadowHelper } from './threeforge/threeforge-v2_6_0.js';
+const helper = new SunShadowHelper(rig.sun);
+scene.add(helper);
+engine.addSystem({ update: () => helper.update(camera) }, 90);
+// wireframe-фрустумы каскадов (цвет = каскад) + направление света; F-клавишей
+// через helper.visible можно включать/выключать
+```
+
+---
+
+## 8.6. Gameplay Kit (v2.8): игра от первого лица
+
+Готовое демо — `examples/sword-field.html` (запуск: `node tools/dev/serve.mjs`, открыть `/`).
+Минимальная сборка «ночная стилизованная игра от первого лица»:
+
+```js
+import * as THREE from 'three';
+import * as TF from 'threeforge';
+
+// ...renderer/scene/camera/engine, rig = createLightRig({scene}), fog, world = createTerrainSystem(...)...
+
+// Ночь, пастельный пост-грейд (GK9) + bloom на звёзды
+rig.setTime(22.6);
+const post = new TF.PostPipeline({
+  renderer, scene, camera, fog,
+  bloom: { enabled: true, threshold: 1.05, intensity: 0.42 },
+  grade: { vignette: 0.34, saturation: 1.1, tint: 0xc9d2ff }
+});
+post.attach(engine);
+
+// Поле цветов (GK3): details: { types: { flower: { density: 1.6 } } } в createTerrainSystem.
+
+// Ходьба от первого лица (GK6) + вьюмодель кулак+меч (GK2/GK7)
+const input = new TF.InputManager(renderer.domElement);
+const ctl = new TF.FirstPersonController({ camera, input, groundFn: (x, z) => world.groundHeight(x, z) });
+ctl.attach(engine);
+renderer.domElement.addEventListener('click', () => ctl.lock());
+
+const vm = new TF.ViewModel({ camera });
+const fist = new THREE.Mesh(TF.createFistGeometry(), TF.createStylizedMaterial({ color: 0xc9a186 }));
+fist.add(new THREE.Mesh(TF.createSwordGeometry({ bladeLength: 0.92 }), TF.createStylizedMaterial({ color: 0xb9c2cf, rim: 0.55 })));
+vm.add(fist, { offset: { x: 0.3, y: -0.33, z: -0.62 } });
+vm.attach(engine);                                    // ОБЯЗАТЕЛЬНО после post.attach
+engine.addSystem({ update: dt => vm.update(dt, ctl) }, 50);
+
+// Гигантские воткнутые мечи (GK1/GK4) + парящие острова (GK5)
+const swords = TF.scatterProps({
+  geometry: TF.createSwordGeometry(), material: giantMat,
+  count: 52, seed: 5, radius: 150, chunkSize: 64,
+  heightFn: (x, z) => world.groundHeight(x, z),
+  scale: [7, 15], tiltMax: 0.24, sink: 1.4, baseRotation: [Math.PI, 0, 0]
+});
+scene.add(swords.group);
+
+const floating = new TF.FloatingProps();
+floating.add(skyRock, { amp: 1.2, freq: 0.02, rotSpeed: 0.008, tilt: 0.015 });
+floating.attach(engine);
+
+// HUD-плашка как в референсе (GK10)
+const hud = new TF.Hud({ title: 'ИГРА', hints: ['Tab — вернуться в конструктор', 'Esc — меню игры'] });
+engine.start();
+```
+
+Стилизованный вид (GK8): `createStylizedMaterial({ color, steps: 3, rim: 0.4 })` —
+MeshToonMaterial со ступенчатым светом и rim-френелем; работает с fog/тенями v2.7/sway.
+
+**Single-file сборка.** `npm run standalone` собирает `examples/sword-field-standalone.html` —
+ОДИН самодостаточный файл (three r186 + движок + демо инлайнятся классическим `<script>`,
+без import map и сервера): открывается двойным кликом с диска (file://), воркеры террейна
+поднимаются из Blob. Пересобрать после правок движка/демо: `npm run standalone`.
+Проверка бандла встроена в сборку (acorn-парсинг + headless-прогон three+движок в node vm).
+
 ## 9. Чек-лист типичных ошибок
 
 | Симптом | Причина / решение |
 |---|---|
 | Физика «взрывается» после сворачивания вкладки | Не через `Engine`: `step(dt)` получает огромный dt. Используйте `fixedUpdate`-обёртку или полагайтесь на `maxStep`/`maxFrameDelta` |
-| Тени солнца пропадают вдалеке | `SunLight`/CSM: держите `lights.cycle` подключённым к `Engine`; для `DirectionalLight` зовите `fitShadowCamera()` (T4) |
+| Тени солнца пропадают вдалеке | `SunLight`/CSM: держите `lights.cycle` подключённым к `Engine`; для `DirectionalLight` зовите `fitShadowCamera()` (T4). Дальность CSM = `min(shadow.camera.far, camera.far)` — поднимите `shadowFar` в `createLightRig` |
+| Тени «кипят»/мерцают при движении | CSM снапается на тексельную сетку автоматически; для `DirectionalLight.followCamera` не отключайте `snap`; поднимите `shadowMapSize` |
+| После `setSunCascadeCount` тени пропали/артефакты | Меняйте каскады ДО первого рендера (define шейдера глобальный); TF-материалы пересобираются сами, чужие — через `material.needsUpdate = true` |
+| Много точечных теней — просел FPS | `LightManager`: `shadowBudget` (грантов/кадр) + `shadowRate` (Гц); куб-карта = 6 граней, держите 1–2 теневых слота |
 | `PostPipeline` не рисует | Нужен `post.attach(engine)`; `renderer` обязателен в конструкторе; при своём цикле — `engine.renderOverride` |
 | TAA «мажет» движущиеся объекты | Динамику нужно регистрировать: `post.trackObject(mesh)` (motion vectors) |
 | Небо не видно / купол уезжает | Группа `createSkySystem` должна оставаться в начале координат — купол позиционируется мировой позицией камеры |
@@ -380,7 +516,9 @@ renderer.dispose();
 |---|---|
 | Игровой цикл, системы, пауза | `Engine` |
 | Время суток, солнце/луна, палитра неба | `SunCycle` (или риг `createLightRig`) |
-| Тени солнца (каскады) | `SunLight` + `installSunShadowPatch` |
+| Тени солнца (каскады, 1–4) | `SunLight` + `installSunShadowPatch`; каскады/сплиты — `setSunCascadeCount`, `shadow.setSplitLambda/setCascadeTiles` |
+| Качество теней (тапы/soft/пресеты) | `setShadowQuality`, `applyShadowQuality('ultra', { rig, lights })` |
+| Отладка каскадов | `SunShadowHelper(sun)` + `helper.update(camera)` |
 | Туман (пресеты, высота, вода) | `FogManager` + `installFogPatch` |
 | Погода (дождь/снег/гроза, ветер, молнии) | `WeatherManager` |
 | Частицы | `ParticleManager` → `createField` (GPU) / `createSystem` (CPU) |
@@ -396,3 +534,4 @@ renderer.dispose();
 | LOD | `LODGroup` + `installDitherLODPatch` |
 | Светящиеся текстуры (окна, лава) | `EmissiveManager` / `installEmissivePatch` |
 | Бюджет источников света | `LightManager` |
+| Бюджет обновлений теневых карт | `LightManager` (`shadowBudget`, `shadowRate`, `setShadowRate`) |

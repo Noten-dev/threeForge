@@ -1,10 +1,23 @@
 /**
- * ThreeForge Engine v2.6.0 — единый ESM-модуль для three.js r186 (без внешних зависимостей).
+ * ThreeForge Engine v2.6.0 + v2.7 Shadow Overhaul + v2.8 Gameplay Kit — единый ESM-модуль для three.js r186
+ * (без внешних зависимостей).
+ *
+ * v2.7 (SH1..SH9): конфигурируемые каскады CSM 1–4 (setSunCascadeCount, splitLambda,
+ * cascadeTiles), генерируемый PCF (setShadowQuality: тапы/soft/фейд всех источников),
+ * плавные ночные тени и тени луны (SunCycle/createLightRig), бюджет обновлений
+ * LightManager (shadowBudget/shadowRate), пресеты (applyShadowQuality), SunShadowHelper.
+ * Дефолты = поведение v2.6. Имена файлов/прежних экспортов не менялись.
+ *
+ * v2.8 (GK1..GK10): Gameplay Kit — FirstPersonController, ViewModel (+хук
+ * PostPipeline.scenePassHook), scatterProps, FloatingProps, Hud, stylized-материалы
+ * (createStylizedMaterial/installStylizedPatch/createGradientMap), процедурные
+ * createSwordGeometry/createFistGeometry/createFlowerGeometry, тип детали 'flower',
+ * grade финального пасса (vignette/saturation/tint). Дефолты нейтральны (186 экспортов).
  *
  * Документация:
- *   API.md       — справочник (167 экспортов: 35 классов, 37 функций, GLSL-чанки, пресеты);
- *   QUICKSTART.md — подключение и рабочие примеры интеграции;
- *   CHANGELOG.md — история исправлений (метки T/F/R/S/L/N/M).
+ *   API.md       — справочник (186 экспортов: 40 классов, 49 функций, GLSL-чанки, пресеты);
+ *   QUICKSTART.md — подключение и рабочие примеры интеграции (8.5 — тени, 8.6 — Gameplay Kit);
+ *   CHANGELOG.md — история исправлений (метки T/F/R/S/L/N/M/SH/GK).
  *
  * Все системы опциональны. Игровой цикл — Engine (fixed timestep); системы
  * подключаются через engine.addSystem({ fixedUpdate?(h), update?(dt, alpha) }, priority).
@@ -577,25 +590,199 @@ const _slCascadeCorners = [
 const SUN_CASCADE_COUNT = 2;
 const SUN_CASCADE_FADE = 0.1;
 
+// ---------------------------------------------------------------------------
+// Глобальное состояние CSM (v2.7 Shadow Overhaul)
+//
+// Число каскадов — СВОЙСТВО ШЕЙДЕРА (define SUN_LIGHT_CASCADES в чанке three
+// shadowmap_pars_fragment задаёт размеры униформ-массивов sunShadowMatrix /
+// sunShadowCascade), поэтому оно одно на рендерер. setSunCascadeCount(n):
+//   1) переопределяет define в ShaderChunk.shadowmap_pars_fragment — все
+//      программы, скомпилированные ПОСЛЕ вызова, получают массивы нужного
+//      размера (включая нативный getSunShadow и shadowmask);
+//   2) переконфигурирует все живые SunLightShadow (реестр);
+//   3) помечает материалы с TF-патчем теней на рекомпиляцию (реестр WeakRef).
+// Программы, скомпилированные ДО вызова, нужно пересобрать (needsUpdate) —
+// поэтому меняйте число каскадов на старте, до первого рендера.
+// ---------------------------------------------------------------------------
+const TF_SHADOWMAP_PARS_SRC = ShaderChunk.shadowmap_pars_fragment;
+let _tfSunCascades = SUN_CASCADE_COUNT;
+const _tfSunShadows = [];
+const _tfShadowMaterials = [];
+
+function getSunCascadeCount() { return _tfSunCascades; }
+
+function setSunCascadeCount(n) {
+	n = Math.round(Number(n));
+	if (!isFinite(n)) n = SUN_CASCADE_COUNT;
+	n = Math.max(1, Math.min(4, n));
+	if (n === _tfSunCascades) return n;
+	_tfSunCascades = n;
+	_tfOverrideCascadeDefine(n);
+	for (let i = _tfSunShadows.length - 1; i >= 0; i--) {
+		_tfSunShadows[i].setCascadeCount(n);
+	}
+	_tfMarkShadowMaterials();
+	return n;
+}
+
+function _tfOverrideCascadeDefine(n) {
+	const anchor = '#define SUN_LIGHT_CASCADES ' + SUN_CASCADE_COUNT;
+	if (n === SUN_CASCADE_COUNT) {
+		ShaderChunk.shadowmap_pars_fragment = TF_SHADOWMAP_PARS_SRC;
+		return;
+	}
+	if (TF_SHADOWMAP_PARS_SRC.indexOf(anchor) === -1) {
+		console.warn('ThreeForge: setSunCascadeCount — якорь "' + anchor + '" не найден в ' +
+			'shadowmap_pars_fragment (изменился three.js?); остаётся нативное число каскадов');
+		return;
+	}
+	ShaderChunk.shadowmap_pars_fragment = TF_SHADOWMAP_PARS_SRC
+		.replace(anchor, '#define SUN_LIGHT_CASCADES ' + n);
+}
+
+function _tfRegisterSunShadow(shadow) {
+	if (_tfSunShadows.indexOf(shadow) === -1) _tfSunShadows.push(shadow);
+}
+
+function _tfUnregisterSunShadow(shadow) {
+	const i = _tfSunShadows.indexOf(shadow);
+	if (i !== -1) _tfSunShadows.splice(i, 1);
+}
+
+function _tfRegisterShadowMaterial(material) {
+	if (typeof WeakRef === 'undefined') return;
+	for (let i = _tfShadowMaterials.length - 1; i >= 0; i--) {
+		const m = _tfShadowMaterials[i].deref();
+		if (m === undefined) _tfShadowMaterials.splice(i, 1);
+		else if (m === material) return;
+	}
+	_tfShadowMaterials.push(new WeakRef(material));
+}
+
+function _tfMarkShadowMaterials() {
+	if (typeof WeakRef === 'undefined') return;
+	for (let i = _tfShadowMaterials.length - 1; i >= 0; i--) {
+		const m = _tfShadowMaterials[i].deref();
+		if (m === undefined) { _tfShadowMaterials.splice(i, 1); continue; }
+		m.needsUpdate = true;
+	}
+}
+
 const SunLightShadow = class extends LightShadow {
-	constructor() {
+	/**
+	 * Каскадные тени солнца (CSM) поверх атласа: N фрустумов-срезов view-камеры
+	 * упакованы в одну карту (mapSize = размер ОДНОГО каскада; атлас =
+	 * mapSize × сумма тайлов). Настройки:
+	 * @param {{cascades?:number, splitLambda?:number, cascadeFade?:number, cascadeTiles?:number[]}} [options]
+	 *   cascades — число каскадов 1..4 (по умолчанию — глобальное getSunCascadeCount());
+	 *   splitLambda — схема сплитов: 0 = логарифмическая, 1 = равномерная,
+	 *     0.5 = их среднее (прежнее поведение three-эталона);
+	 *   cascadeFade — доля глубины каскада, растворяющаяся в следующем (0.02..0.9);
+	 *   cascadeTiles — целые ВЕСА каскадов в атласе ([2,1] — ближний каскад
+	 *     вдвое шире → вдвое выше разрешение вблизи); null/undefined = по 1.
+	 */
+	constructor(options = {}) {
 		super(new OrthographicCamera(-5, 5, 5, -5, 0.5, 500));
 		this.isSunLightShadow = true;
 		this.mapSize.set(1024, 1024);
+		this.splitLambda = 0.5;
+		this.cascadeFade = SUN_CASCADE_FADE;
+		this.cascadeTiles = null;
+		this._tiles = [];
+		this._tileOffsets = [];
+		if (options.cascades !== undefined && Math.round(Number(options.cascades)) !== _tfSunCascades) {
+			console.warn('ThreeForge: SunLightShadow({cascades:' + options.cascades + '}) не совпадает с глобальным ' +
+				'getSunCascadeCount()=' + _tfSunCascades + ' — define SUN_LIGHT_CASCADES в шейдерах глобальный; ' +
+				'используйте setSunCascadeCount(n)');
+		}
+		this._initCascades(options.cascades !== undefined ? options.cascades : _tfSunCascades);
+		if (options.splitLambda !== undefined) this.setSplitLambda(options.splitLambda);
+		if (options.cascadeFade !== undefined) this.setCascadeFade(options.cascadeFade);
+		if (options.cascadeTiles !== undefined) this.setCascadeTiles(options.cascadeTiles);
+		_tfRegisterSunShadow(this);
+	}
+
+	_initCascades(count) {
+		count = Math.round(Number(count));
+		if (!isFinite(count)) count = SUN_CASCADE_COUNT;
+		count = Math.max(1, Math.min(4, count));
+		this._cascadeCount = count;
 		this._cameras = [];
 		this._matrices = [];
 		this._frustums = [];
-		this._cascadeSplits = new Array(SUN_CASCADE_COUNT + 1).fill(0);
 		this._cascadeData = [];
-		this._viewportCount = SUN_CASCADE_COUNT;
-		this._frameExtents.set(2, 1);
-		for (let i = 0; i < SUN_CASCADE_COUNT; i++) {
+		this._cascadeSplits = new Array(count + 1).fill(0);
+		this._viewports.length = 0;
+		for (let i = 0; i < count; i++) {
 			this._cameras.push(new OrthographicCamera());
 			this._matrices.push(new Matrix4());
 			this._frustums.push(new Frustum());
 			this._cascadeData.push(new Vector4());
+			this._viewports.push(new Vector4());
 		}
-		while (this._viewports.length < SUN_CASCADE_COUNT) this._viewports.push(new Vector4());
+		this._viewportCount = count;
+		this._updateTiles();
+		if (this.map !== null && this.map !== undefined) {
+			this.map.dispose();
+			this.map = null;
+		}
+		this.needsUpdate = true;
+	}
+
+	_updateTiles() {
+		const n = this._cascadeCount;
+		const src = this.cascadeTiles;
+		this._tiles.length = 0;
+		this._tileOffsets.length = 0;
+		let acc = 0;
+		for (let i = 0; i < n; i++) {
+			const w = (src !== null && src !== undefined && src[i] !== undefined)
+				? Math.max(1, Math.min(8, Math.round(src[i]))) : 1;
+			this._tiles.push(w);
+			this._tileOffsets.push(acc);
+			acc += w;
+		}
+		this._frameExtents.set(acc, 1);
+	}
+
+	/** Число каскадов 1..4 (пересоздаёт камеры/атлас; карта будет пересобрана). */
+	setCascadeCount(n) {
+		n = Math.max(1, Math.min(4, Math.round(Number(n)) || SUN_CASCADE_COUNT));
+		if (n !== _tfSunCascades) {
+			console.warn('ThreeForge: SunLightShadow.setCascadeCount(' + n + ') не совпадает с глобальным ' +
+				'getSunCascadeCount()=' + _tfSunCascades + ' — define SUN_LIGHT_CASCADES в шейдерах глобальный; ' +
+				'используйте setSunCascadeCount(n) для всех теней сразу');
+		}
+		if (n !== this._cascadeCount) this._initCascades(n);
+		return this;
+	}
+
+	getCascadeCount() { return this._cascadeCount; }
+
+	/** Схема сплитов: 0 = логарифмическая, 1 = равномерная (дефолт 0.5). */
+	setSplitLambda(x) {
+		x = Number(x);
+		this.splitLambda = isFinite(x) ? Math.max(0, Math.min(1, x)) : 0.5;
+		return this;
+	}
+
+	/** Доля глубины каскада, растворяющаяся в следующем (0.02..0.9). */
+	setCascadeFade(f) {
+		f = Number(f);
+		this.cascadeFade = isFinite(f) ? Math.max(0.02, Math.min(0.9, f)) : SUN_CASCADE_FADE;
+		return this;
+	}
+
+	/** Веса каскадов в атласе ([2,1,1,1] — ближний вдвое детальнее); null = по 1. */
+	setCascadeTiles(tiles) {
+		this.cascadeTiles = Array.isArray(tiles) ? tiles.slice(0, 4) : null;
+		this._updateTiles();
+		if (this.map !== null && this.map !== undefined) {
+			this.map.dispose();
+			this.map = null;
+		}
+		this.needsUpdate = true;
+		return this;
 	}
 
 	getCamera(cascadeIndex = 0) { return this._cameras[cascadeIndex]; }
@@ -605,29 +792,32 @@ const SunLightShadow = class extends LightShadow {
 	updateMatrices(light, viewCamera) {
 		if (viewCamera === undefined) return;
 
+		const cascadeCount = this._cascadeCount;
+		const tiles = this._tiles;
+		const tileOffsets = this._tileOffsets;
+
 		const insetX = Math.min(0.25, (Math.ceil(this.radius) + 1) / this.mapSize.x);
 		const insetY = Math.min(0.25, (Math.ceil(this.radius) + 1) / this.mapSize.y);
-		for (let i = 0; i < SUN_CASCADE_COUNT; i++) {
-			this._viewports[i].set(i + insetX, insetY, 1 - 2 * insetX, 1 - 2 * insetY);
+		for (let i = 0; i < cascadeCount; i++) {
+			this._viewports[i].set(tileOffsets[i] + insetX, insetY, tiles[i] - 2 * insetX, 1 - 2 * insetY);
 		}
 
-		const resolutionX = this.mapSize.x * (1 - 2 * insetX);
 		const resolutionY = this.mapSize.y * (1 - 2 * insetY);
-		const resolution = Math.min(resolutionX, resolutionY);
 
 		const camera = this.camera;
 		const cameraNear = viewCamera.near;
 		const cameraFar = Math.max(cameraNear + 1e-6, Math.min(camera.far, viewCamera.far));
 
 		const splits = this._cascadeSplits;
+		const lambda = this.splitLambda;
 		splits[0] = cameraNear;
-		for (let i = 1; i < SUN_CASCADE_COUNT; i++) {
-			const amount = i / SUN_CASCADE_COUNT;
+		for (let i = 1; i < cascadeCount; i++) {
+			const amount = i / cascadeCount;
 			const uniform = cameraNear + (cameraFar - cameraNear) * amount;
 			const logarithmic = cameraNear > 0 ? cameraNear * Math.pow(cameraFar / cameraNear, amount) : uniform;
-			splits[i] = (uniform + logarithmic) * 0.5;
+			splits[i] = logarithmic + (uniform - logarithmic) * lambda;
 		}
-		splits[SUN_CASCADE_COUNT] = cameraFar;
+		splits[cascadeCount] = cameraFar;
 
 		_slLightDirection.setFromMatrixPosition(light.matrixWorld).negate().normalize();
 
@@ -658,11 +848,12 @@ const SunLightShadow = class extends LightShadow {
 		globalMaxZ += cameraFar;
 
 		const shadowNear = camera.near;
+		const cascadeFade = this.cascadeFade;
 
-		for (let i = 0; i < SUN_CASCADE_COUNT; i++) {
+		for (let i = 0; i < cascadeCount; i++) {
 			const cascadeNear = i === 0 ? splits[0] : this._cascadeData[i - 1].z;
 			const cascadeFar = splits[i + 1];
-			const fadeStart = cascadeFar - SUN_CASCADE_FADE * (cascadeFar - splits[i]);
+			const fadeStart = cascadeFar - cascadeFade * (cascadeFar - splits[i]);
 			this._cascadeData[i].set(i === 0 ? -1e10 : cascadeNear, cascadeFar, fadeStart, 0);
 
 			const nearAlpha = (cascadeNear - cameraNear) / (cameraFar - cameraNear);
@@ -683,6 +874,8 @@ const SunLightShadow = class extends LightShadow {
 			}
 			let radius = Math.sqrt(radiusSq);
 
+			const resolutionX = this.mapSize.x * (tiles[i] - 2 * insetX);
+			const resolution = Math.min(resolutionX, resolutionY);
 			if (resolution > 1) {
 				radius /= 1 - 1 / resolution;
 				const texelSizeX = 2 * radius / resolutionX;
@@ -711,16 +904,51 @@ const SunLightShadow = class extends LightShadow {
 			this._updateMatrix(cascadeCamera, this._matrices[i], this._frustums[i], this._viewports[i]);
 		}
 	}
+
+	copy(source, recursive) {
+		super.copy(source, recursive);
+		if (source.splitLambda !== undefined) this.splitLambda = source.splitLambda;
+		if (source.cascadeFade !== undefined) this.cascadeFade = source.cascadeFade;
+		if (source.cascadeTiles !== undefined && source.cascadeTiles !== null) {
+			this.cascadeTiles = source.cascadeTiles.slice();
+		} else {
+			this.cascadeTiles = null;
+		}
+		const n = source._cascadeCount !== undefined ? source._cascadeCount : this._cascadeCount;
+		if (n !== this._cascadeCount) this._initCascades(n);
+		else this._updateTiles();
+		return this;
+	}
+
+	toJSON() {
+		const data = super.toJSON();
+		data.cascades = this._cascadeCount;
+		data.splitLambda = this.splitLambda;
+		data.cascadeFade = this.cascadeFade;
+		if (this.cascadeTiles !== null) data.cascadeTiles = this.cascadeTiles.slice();
+		return data;
+	}
+
+	dispose() {
+		_tfUnregisterSunShadow(this);
+		if (typeof super.dispose === 'function') super.dispose();
+	}
 };
 
 const SunLight = class extends Light {
-	constructor(color, intensity) {
+	/**
+	 * @param {number|THREE.Color|string} [color]
+	 * @param {number} [intensity]
+	 * @param {object} [shadowOptions] Опции SunLightShadow (cascades, splitLambda,
+	 *   cascadeFade, cascadeTiles) — применяются к this.shadow.
+	 */
+	constructor(color, intensity, shadowOptions) {
 		super(color, intensity);
 		this.isSunLight = true;
 		this.type = 'SunLight';
 		this.position.copy(Object3D.DEFAULT_UP);
 		this.updateMatrix();
-		this.shadow = new SunLightShadow();
+		this.shadow = new SunLightShadow(shadowOptions !== undefined && shadowOptions !== null ? shadowOptions : {});
 	}
 
 	dispose() {
@@ -799,29 +1027,101 @@ function cloneMaterialPatched(material) {
 	return copy;
 }
 
-const TF_SUN_SHADOW_FN = `
-#if defined( USE_SHADOWMAP ) && NUM_SUN_LIGHT_SHADOWS > 0
-// v2.2: общие униформы качества теней (объявлены здесь, значения пишет
-// PostPipeline или игра; дефолты = прежнее поведение):
+// ---------------------------------------------------------------------------
+// Качество теней (v2.7 Shadow Overhaul). GLSL-функции ГЕНЕРИРУЮТСЯ под настройки:
+//   taps          — число Vogel-тапов PCF (1..64; дефолт 12 = прежнее поведение);
+//   soft          — второе «широкое» PCF-кольцо: мягкие тени с усилением по
+//                   дальности (аппроксимация contact hardening; ×2 стоимость
+//                   сэмплинга, работает только в SHADOWMAP_TYPE_PCF);
+//   softMix / softDepthGrowth / softRadius — значения униформы tfShadowSoft(x,y,z):
+//                   базовая доля широкого кольца, прирост доли на view-глубину
+//                   (нормируется на tfShadowFade.y), множитель радиуса кольца;
+//   fadeAllLights — растворять в дымке (tfShadowFade) тени ВСЕХ источников
+//                   (directional/spot/point), а не только солнца (дефолт вкл).
+// Изменения: tfShadowCacheKey (динамический ключ кэша программ) + реестр
+// WeakRef пропатченных материалов → setShadowQuality()/setSunCascadeCount()
+// сами помечают их на рекомпиляцию.
+// ---------------------------------------------------------------------------
+const TF_SHADOW_QUALITY = {
+	taps: 12,
+	soft: false,
+	softMix: 0.55,
+	softDepthGrowth: 0.45,
+	softRadius: 3.0,
+	fadeAllLights: true
+};
+
+// Общие униформы качества теней (значения пишут PostPipeline / setShadowQuality):
 //   tfShadowRot  — временнóе вращение Vogel-диска (кадровая фаза): с TAA шум
 //                  PCF усредняется накоплением, без TAA остаётся 0 (статично);
 //   tfShadowFade — (start, end) view-глубины: тени растворяются в тумане —
 //                  вдали, где 1 экранный пиксель накрывает десятки текселей
-//                  карты теней, PCF-алиасинг уходит вместе с тенью.
+//                  карты теней, PCF-алиасинг уходит вместе с тенью;
+//   tfShadowSoft — (mix, depthGrowth, radiusMul) мягких теней (soft-режим).
+const TF_SHADOW_UNIFORMS = {
+	tfShadowRot: { value: 0 },
+	tfShadowFade: { value: new Vector2(1e8, 1e8 + 1) },
+	tfShadowSoft: { value: new Vector3(TF_SHADOW_QUALITY.softMix, TF_SHADOW_QUALITY.softDepthGrowth, TF_SHADOW_QUALITY.softRadius) }
+};
+
+// Динамический ключ кэша программ: toString() вычисляется в момент компиляции,
+// поэтому смена каскадов/тиров/режимов ДАЁТ новый ключ (three не переиспользует
+// старую программу). Живой объект добавляется в __tfCacheKeys один раз.
+const tfShadowCacheKey = {
+	toString() {
+		const q = TF_SHADOW_QUALITY;
+		return 'sunshadow:c' + _tfSunCascades + ':t' + q.taps +
+			(q.soft === true ? ':s' : '') + (q.fadeAllLights === true ? ':f' : '');
+	}
+};
+
+function tfVogelRing(taps, radiusExpr, phiExpr) {
+	const rows = [];
+	for (let i = 0; i < taps; i++) {
+		rows.push('\t\t\ttexture( smap, vec3( shadowCoord.xy + vogelDiskSample( ' + i + ', ' +
+			taps + ', ' + phiExpr + ' ) * ' + radiusExpr + ', shadowCoord.z ) )');
+	}
+	return rows.join(' +\n');
+}
+
+function tfBuildShadowFn(q) {
+	const taps = Math.max(1, Math.min(64, Math.round(q.taps) || 12));
+	const weight = (1 / taps).toFixed(7);
+	const soft = q.soft === true;
+	const softBlock = soft ? `
+		if ( softMix > 0.001 ) {
+			// второе кольцо: шире в tfShadowSoft.z раз и повёрнуто на π —
+			// вместе с TAA-ротацией даёт плотное покрытие penumbra-зоны
+			float radiusSoft = radius * max( tfShadowSoft.z, 1.0 );
+			float shadowSoft = (
+` + tfVogelRing(taps, 'radiusSoft', 'phi + 3.14159265') + `
+			) * ${weight};
+			shadow = mix( shadow, shadowSoft, softMix );
+		}` : '';
+	const softMixExpr = soft
+		? 'clamp( tfShadowSoft.x + tfShadowSoft.y * viewDepth / max( tfShadowFade.y, 1.0 ), 0.0, 1.0 )'
+		: '0.0';
+	return `
+#if defined( USE_SHADOWMAP ) && ( NUM_SUN_LIGHT_SHADOWS > 0 || NUM_DIR_LIGHT_SHADOWS > 0 || NUM_SPOT_LIGHT_SHADOWS > 0 || NUM_POINT_LIGHT_SHADOWS > 0 )
 uniform float tfShadowRot;
 uniform vec2 tfShadowFade;
+uniform vec3 tfShadowSoft;
+
+// Растворение тени в дымке расстояния (единый метрик для всех источников:
+// view-глубина -geometryPosition.z == vSunShadowWorldPosition.w солнца).
+float tfFadeShadow( float shadow, float viewDepth ) {
+	float f = 1.0 - smoothstep( tfShadowFade.x, tfShadowFade.y, viewDepth );
+	return mix( 1.0, shadow, f );
+}
 
 // ИСПРАВЛЕНО (C2): three объявляет interleavedGradientNoise()/vogelDiskSample()
 // ТОЛЬКО под #if defined( SHADOWMAP_TYPE_PCF ), а sunShadowMap — это
-// sampler2DShadow лишь в PCF-ветке (в Basic/VSM это sampler2D). Прежняя версия
-// патча безусловно подставляла sampler2DShadow и Vogel-сэмплинг, поэтому при
-// renderer.shadowMap.type = BasicShadowMap/VSMShadowMap шейдер НЕ КОМПИЛИРОВАЛСЯ
-// (чёрный экран). Теперь 12-tap Vogel существует только в PCF-ветке, а прочие
-// режимы используют встроенный getShadow() того же типа сэмплера — патч
-// корректен при ЛЮБОМ shadowMap.type, tfShadowFade работает во всех режимах.
-#if defined( SHADOWMAP_TYPE_PCF )
+// sampler2DShadow лишь в PCF-ветке (в Basic/VSM это sampler2D). Vogel-сэмплинг
+// существует только в PCF-ветке, прочие режимы используют встроенный getShadow()
+// того же типа сэмплера — патч корректен при ЛЮБОМ shadowMap.type.
+#if defined( SHADOWMAP_TYPE_PCF ) && NUM_SUN_LIGHT_SHADOWS > 0
 
-float tfGetShadowSample( sampler2DShadow smap, vec2 smapSize, float shadowIntensity, float shadowBias, float shadowRadius, vec4 shadowCoord ) {
+float tfGetShadowSample( sampler2DShadow smap, vec2 smapSize, float shadowIntensity, float shadowBias, float shadowRadius, vec4 shadowCoord, float softMix ) {
 	shadowCoord.xyz /= shadowCoord.w;
 	shadowCoord.z += shadowBias;
 	bool inFrustum = shadowCoord.x >= 0.0 && shadowCoord.x <= 1.0 && shadowCoord.y >= 0.0 && shadowCoord.y <= 1.0;
@@ -836,36 +1136,27 @@ float tfGetShadowSample( sampler2DShadow smap, vec2 smapSize, float shadowIntens
 		float radius = max( shadowRadius * texelSize.x, foot * 1.25 );
 		float phi = ( interleavedGradientNoise( gl_FragCoord.xy ) + tfShadowRot ) * PI2;
 		shadow = (
-			texture( smap, vec3( shadowCoord.xy + vogelDiskSample( 0, 12, phi ) * radius, shadowCoord.z ) ) +
-			texture( smap, vec3( shadowCoord.xy + vogelDiskSample( 1, 12, phi ) * radius, shadowCoord.z ) ) +
-			texture( smap, vec3( shadowCoord.xy + vogelDiskSample( 2, 12, phi ) * radius, shadowCoord.z ) ) +
-			texture( smap, vec3( shadowCoord.xy + vogelDiskSample( 3, 12, phi ) * radius, shadowCoord.z ) ) +
-			texture( smap, vec3( shadowCoord.xy + vogelDiskSample( 4, 12, phi ) * radius, shadowCoord.z ) ) +
-			texture( smap, vec3( shadowCoord.xy + vogelDiskSample( 5, 12, phi ) * radius, shadowCoord.z ) ) +
-			texture( smap, vec3( shadowCoord.xy + vogelDiskSample( 6, 12, phi ) * radius, shadowCoord.z ) ) +
-			texture( smap, vec3( shadowCoord.xy + vogelDiskSample( 7, 12, phi ) * radius, shadowCoord.z ) ) +
-			texture( smap, vec3( shadowCoord.xy + vogelDiskSample( 8, 12, phi ) * radius, shadowCoord.z ) ) +
-			texture( smap, vec3( shadowCoord.xy + vogelDiskSample( 9, 12, phi ) * radius, shadowCoord.z ) ) +
-			texture( smap, vec3( shadowCoord.xy + vogelDiskSample( 10, 12, phi ) * radius, shadowCoord.z ) ) +
-			texture( smap, vec3( shadowCoord.xy + vogelDiskSample( 11, 12, phi ) * radius, shadowCoord.z ) )
-		) * 0.0833333;
+${tfVogelRing(taps, 'radius', 'phi')}
+		) * ${weight};${softBlock}
 	}
 	return mix( 1.0, shadow, shadowIntensity );
 }
 
-float tfSunCascadeSample( sampler2DShadow smap, SunLightShadow sls, vec4 shadowCoord ) {
-	return tfGetShadowSample( smap, sls.shadowMapSize, sls.shadowIntensity, sls.shadowBias, sls.shadowRadius, shadowCoord );
+float tfSunCascadeSample( sampler2DShadow smap, SunLightShadow sls, vec4 shadowCoord, float softMix ) {
+	return tfGetShadowSample( smap, sls.shadowMapSize, sls.shadowIntensity, sls.shadowBias, sls.shadowRadius, shadowCoord, softMix );
 }
 
-#else
+#elif NUM_SUN_LIGHT_SHADOWS > 0
 
 // Basic / VSM: один вызов встроенного getShadow() (перегрузка под sampler2D
-// объявлена в shadowmap_pars_fragment для обоих режимов).
-float tfSunCascadeSample( sampler2D smap, SunLightShadow sls, vec4 shadowCoord ) {
+// объявлена в shadowmap_pars_fragment для обоих режимов); softMix игнорируется.
+float tfSunCascadeSample( sampler2D smap, SunLightShadow sls, vec4 shadowCoord, float softMix ) {
 	return getShadow( smap, sls.shadowMapSize, sls.shadowIntensity, sls.shadowBias, sls.shadowRadius, shadowCoord );
 }
 
 #endif
+
+#if NUM_SUN_LIGHT_SHADOWS > 0
 
 float tfGetSunShadow(
 	#if defined( SHADOWMAP_TYPE_PCF )
@@ -878,52 +1169,147 @@ float tfGetSunShadow(
 	float viewDepth = vSunShadowWorldPosition.w;
 	int cascadeOffset = shadowIndex * SUN_LIGHT_CASCADES;
 	float shadow = 1.0;
-	// каскад 1 (дальний), затем каскад 0 (ближний); индексы статические
-	vec4 c1 = sunShadowCascade[ cascadeOffset + 1 ];
-	if ( viewDepth >= c1.x && viewDepth < c1.y ) {
-		float cs = tfSunCascadeSample( smap, sls, sunShadowMatrix[ cascadeOffset + 1 ] * shadowWorldPosition );
-		shadow = mix( cs, shadow, smoothstep( c1.z, c1.y, viewDepth ) );
+	// soft-режим: чем дальше пиксель, тем шире penumbra (contact hardening
+	// по дальности; нормировка на tfShadowFade.y = границу растворения теней)
+	float softMix = ${softMixExpr};
+	// каскады обрабатываются от дальних к ближним; цикл на ЛЮБОЕ число
+	// SUN_LIGHT_CASCADES (задаётся setSunCascadeCount, 1..4)
+	for ( int i = SUN_LIGHT_CASCADES - 1; i >= 0; i -- ) {
+		vec4 c = sunShadowCascade[ cascadeOffset + i ];
+		if ( viewDepth >= c.x && viewDepth < c.y ) {
+			float cs = tfSunCascadeSample( smap, sls, sunShadowMatrix[ cascadeOffset + i ] * shadowWorldPosition, softMix );
+			shadow = mix( cs, shadow, smoothstep( c.z, c.y, viewDepth ) );
+		}
 	}
-	vec4 c0 = sunShadowCascade[ cascadeOffset ];
-	if ( viewDepth >= c0.x && viewDepth < c0.y ) {
-		float cs = tfSunCascadeSample( smap, sls, sunShadowMatrix[ cascadeOffset + 0 ] * shadowWorldPosition );
-		shadow = mix( cs, shadow, smoothstep( c0.z, c0.y, viewDepth ) );
-	}
-	// v2.2: растворение теней в дымке расстояния (борьба с PCF-алиасингом
+	// растворение теней в дымке расстояния (борьба с PCF-алиасингом
 	// вдали + воздушная перспектива: реальные тени в тумане не читаются)
 	float fade = 1.0 - smoothstep( tfShadowFade.x, tfShadowFade.y, viewDepth );
 	shadow = mix( 1.0, shadow, fade );
 	return shadow;
 }
 #endif
+#endif
 `;
+}
 
-const TF_SHADOW_UNIFORMS = {
-	tfShadowRot: { value: 0 },
-	tfShadowFade: { value: new Vector2(1e8, 1e8 + 1) }
-};
+let TF_SUN_SHADOW_FN = tfBuildShadowFn(TF_SHADOW_QUALITY);
+
+/** Текущие настройки качества теней (копия). */
+function getShadowQuality() { return Object.assign({}, TF_SHADOW_QUALITY); }
+
+/**
+ * Изменить качество теней глобально (для всех материалов с installSunShadowPatch).
+ *
+ * Смена taps/soft/fadeAllLights перегенерирует GLSL и помечает пропатченные
+ * материалы на рекомпиляцию (one-time фриз — зовите на паузе/загрузке);
+ * softMix/softDepthGrowth/softRadius — униформы (без рекомпиляции).
+ *
+ * @param {{taps?:number, soft?:boolean|{mix?:number, depthGrowth?:number, radius?:number, enabled?:boolean},
+ *   softMix?:number, softDepthGrowth?:number, softRadius?:number, fadeAllLights?:boolean}} [q]
+ * @returns {object} Итоговые настройки (копия).
+ */
+function setShadowQuality(q) {
+	if (q === undefined || q === null) return getShadowQuality();
+	let glslChanged = false;
+	let paramsChanged = false;
+	const Q = TF_SHADOW_QUALITY;
+	if (q.taps !== undefined) {
+		const t = Math.max(1, Math.min(64, Math.round(Number(q.taps)) || 12));
+		if (t !== Q.taps) { Q.taps = t; glslChanged = true; }
+	}
+	const softObj = (q.soft !== undefined && q.soft !== null && typeof q.soft === 'object') ? q.soft : null;
+	const softFlag = softObj !== null
+		? (softObj.enabled === true || softObj.enabled === undefined)
+		: (q.soft === true ? true : (q.soft === false ? false : null));
+	if (softFlag !== null && softFlag !== Q.soft) { Q.soft = softFlag; glslChanged = true; }
+	const setNum = (v, key, min, max) => {
+		if (v === undefined) return;
+		const n = Number(v);
+		if (!isFinite(n)) return;
+		const c = Math.max(min, Math.min(max, n));
+		if (c !== Q[key]) { Q[key] = c; paramsChanged = true; }
+	};
+	if (softObj !== null) {
+		setNum(softObj.mix, 'softMix', 0, 1);
+		setNum(softObj.depthGrowth, 'softDepthGrowth', 0, 4);
+		setNum(softObj.radius, 'softRadius', 1, 12);
+	}
+	setNum(q.softMix, 'softMix', 0, 1);
+	setNum(q.softDepthGrowth, 'softDepthGrowth', 0, 4);
+	setNum(q.softRadius, 'softRadius', 1, 12);
+	if (q.fadeAllLights !== undefined) {
+		const f = q.fadeAllLights !== false;
+		if (f !== Q.fadeAllLights) { Q.fadeAllLights = f; glslChanged = true; }
+	}
+	if (glslChanged) {
+		TF_SUN_SHADOW_FN = tfBuildShadowFn(Q);
+		_tfMarkShadowMaterials();
+	}
+	if (paramsChanged || glslChanged) {
+		TF_SHADOW_UNIFORMS.tfShadowSoft.value.set(Q.softMix, Q.softDepthGrowth, Q.softRadius);
+	}
+	return getShadowQuality();
+}
+
+// Якоря вызовов встроенных теневых функций в lights_fragment_begin (r186):
+// патч оборачивает их в tfFadeShadow(<call>, -geometryPosition.z) — единое
+// растворение в дымке для directional/spot/point (метрик глубины тот же,
+// что у солнца: geometryPosition = -vViewPosition = mvPosition.xyz).
+const TF_FADE_WRAP_HEADS = [
+	'getShadow( directionalShadowMap[ i ]',
+	'getShadow( spotShadowMap[ i ]',
+	'getPointShadow( pointShadowMap[ i ]'
+];
+
+function tfWrapShadowCallsWithFade(chunkSrc) {
+	let src = chunkSrc;
+	let wrapped = 0;
+	for (let h = 0; h < TF_FADE_WRAP_HEADS.length; h++) {
+		const head = TF_FADE_WRAP_HEADS[h];
+		const at = src.indexOf(head);
+		if (at === -1) continue;
+		let depth = 0;
+		let end = -1;
+		for (let i = at; i < src.length; i++) {
+			const ch = src.charAt(i);
+			if (ch === '(') depth++;
+			else if (ch === ')') { depth--; if (depth === 0) { end = i; break; } }
+		}
+		if (end === -1) continue;
+		const call = src.slice(at, end + 1);
+		src = src.slice(0, at) + 'tfFadeShadow( ' + call + ', -geometryPosition.z )' + src.slice(end + 1);
+		wrapped++;
+	}
+	return wrapped > 0 ? src : null;
+}
 
 function installSunShadowPatch(material) {
 	if (material.__tfSunShadowPatched === true) return material;
 	material.__tfSunShadowPatched = true;
-	tfAddProgramCacheKey(material, 'sunshadow');
+	tfAddProgramCacheKey(material, tfShadowCacheKey);
 	tfRecordPatch(material, { name: 'sunshadow', replay: (copy) => installSunShadowPatch(copy) });
+	_tfRegisterShadowMaterial(material);
 	tfChainOnBeforeCompile(material, function (shader, renderer) {
 		shader.uniforms.tfShadowRot = TF_SHADOW_UNIFORMS.tfShadowRot;
 		shader.uniforms.tfShadowFade = TF_SHADOW_UNIFORMS.tfShadowFade;
+		shader.uniforms.tfShadowSoft = TF_SHADOW_UNIFORMS.tfShadowSoft;
 		const parsTag = '#include <shadowmap_pars_fragment>';
 		const beginTag = '#include <lights_fragment_begin>';
-		const callSrc = 'getSunShadow( sunShadowMap[ i ], sunLightShadow, UNROLLED_LOOP_INDEX )';
 		if (shader.fragmentShader.indexOf(parsTag) === -1 || shader.fragmentShader.indexOf(beginTag) === -1) {
 			console.warn('ThreeForge: sun shadow patch — чанки не найдены, материал останется на встроенном пути');
 			return;
 		}
 		let beginChunk = ShaderChunk.lights_fragment_begin;
+		const callSrc = 'getSunShadow( sunShadowMap[ i ], sunLightShadow, UNROLLED_LOOP_INDEX )';
 		if (beginChunk.indexOf(callSrc) === -1) {
 			console.warn('ThreeForge: sun shadow patch — вызов getSunShadow не совпал, материал останется на встроенном пути');
 			return;
 		}
 		beginChunk = beginChunk.replace(callSrc, 'tfGetSunShadow( sunShadowMap[ UNROLLED_LOOP_INDEX ], sunLightShadow, UNROLLED_LOOP_INDEX )');
+		if (TF_SHADOW_QUALITY.fadeAllLights === true) {
+			const wrapped = tfWrapShadowCallsWithFade(beginChunk);
+			if (wrapped !== null) beginChunk = wrapped;
+		}
 		shader.fragmentShader = shader.fragmentShader
 			.replace(parsTag, parsTag + '\n' + TF_SUN_SHADOW_FN)
 			.replace(beginTag, beginChunk);
@@ -986,6 +1372,8 @@ const SunCycle = class extends EventDispatcher {
 		this.sunIntensity = 0;
 		this.hemiIntensity = 0;
 		this.moonIntensity = 0;
+		this.shadowFactor = 0;
+		this.moonShadowFactor = 0;
 		this._white = new Color(1, 1, 1);
 
 		this.update(0);
@@ -1056,6 +1444,13 @@ const SunCycle = class extends EventDispatcher {
 
 		this.hemiIntensity = 0.14 + 0.95 * this.dayFactor + 0.15 * this.sunsetFactor;
 		this.moonIntensity = this.moonIntensityMax * this.nightFactor;
+
+		// v2.7: множитель теней солнца/луны. ПЛАВНЫЙ (вместо прежнего порога
+		// sunIntensity > 0.05): тени растворяются у горизонта вместе со светом —
+		// ночью застывшая карта заката больше не сэмплируется (shadow.intensity
+		// → 0), а на рассвете не «включается» скачком.
+		this.shadowFactor = _scSmooth(-0.02, 0.1, se);
+		this.moonShadowFactor = _scSmooth(-0.02, 0.1, -se);
 	}
 
 	_apply() {
@@ -1065,7 +1460,11 @@ const SunCycle = class extends EventDispatcher {
 			sun.color.copy(this.sunColor);
 			sun.intensity = this.sunIntensity;
 			if (sun.shadow !== undefined && sun.shadow !== null) {
-				const active = this.sunIntensity > 0.05;
+				// v2.7: интенсивность теней следует за высотой солнца (0 ночью —
+				// застывшая карта заката НЕ сэмплируется; рассвет/закат без щелчка).
+				const intensity = sun.castShadow === true ? this.shadowFactor : 0;
+				const active = intensity > 0.002;
+				sun.shadow.intensity = intensity;
 				if (active && sun.shadow.autoUpdate === false) sun.shadow.needsUpdate = true;
 				sun.shadow.autoUpdate = active;
 			}
@@ -1079,6 +1478,17 @@ const SunCycle = class extends EventDispatcher {
 			this.moon.position.copy(this.moonDirection).multiplyScalar(this.sunDistance);
 			this.moon.color.copy(this.palette.moon);
 			this.moon.intensity = this.moonIntensity;
+			// v2.7: лунные тени (если rig включил moon.castShadow): карта
+			// обновляется только когда луна реально светит; днём проход теней
+			// луны не рендерится (экономия 1 shadow map), состав источников
+			// не меняется — без рекомпиляции программ.
+			const moon = this.moon;
+			if (moon.castShadow === true && moon.shadow !== undefined && moon.shadow !== null) {
+				moon.shadow.intensity = this.moonShadowFactor;
+				const on = this.moonIntensity > 0.01 && this.moonShadowFactor > 0.002;
+				if (on && moon.shadow.autoUpdate === false) moon.shadow.needsUpdate = true;
+				moon.shadow.autoUpdate = on;
+			}
 		}
 		if (this.fogColor !== null) this.fogColor.copy(this.horizonColor);
 
@@ -1096,7 +1506,10 @@ const SunCycle = class extends EventDispatcher {
 			water.uSunIntensity.value = this.sunIntensity;
 			const tint = Math.max(this.dayFactor, 0.3 * this.nightFactor);
 			water.uTint.value.copy(this.palette.waterTintNight).lerp(this._white, tint);
-			let fade = (sun !== null && sun.shadow !== undefined && sun.shadow !== null && sun.shadow.autoUpdate) ? 1 : 0;
+			// v2.7: плавный фейд из shadow.intensity (раньше — булев autoUpdate):
+			// блики воды гаснут/растут вместе с тенями на рассвете и закате
+			let fade = (sun !== null && sun.shadow !== undefined && sun.shadow !== null && sun.shadow.intensity !== undefined)
+				? Math.max(0, Math.min(1, sun.shadow.intensity)) : 0;
 			if (this.shadowFadeOut !== null) fade *= this.shadowFadeOut();
 			water.uShadowFade.value = fade;
 		}
@@ -1507,7 +1920,29 @@ function createLightRig(options = {}) {
 		sun.shadow.camera.near = options.shadowNear !== undefined ? options.shadowNear : 0.5;
 		sun.shadow.camera.far = options.shadowFar !== undefined ? options.shadowFar : 260;
 	}
-	moon.castShadow = false;
+	// v2.7: лунные тени (опция moonShadow). castShadow включается СРАЗУ —
+	// состав источников (NUM_DIR_LIGHT_SHADOWS) не меняется в рантайме, поэтому
+	// рекомпиляции программ при восходе/заходе луны нет; ночью SunCycle сам
+	// включает autoUpdate, днём проход теней луны не рендерится.
+	let moonShadowCfg = null;
+	if (options.moonShadow === true || (options.moonShadow !== null && typeof options.moonShadow === 'object' && options.moonShadow !== undefined)) {
+		const mo = options.moonShadow === true ? {} : options.moonShadow;
+		moon.castShadow = true;
+		const mms = mo.mapSize !== undefined ? mo.mapSize : 1024;
+		moon.shadow.mapSize.set(mms, mms);
+		moon.shadow.bias = mo.bias !== undefined ? mo.bias : -0.0004;
+		moon.shadow.normalBias = mo.normalBias !== undefined ? mo.normalBias : 0.03;
+		moon.shadow.radius = mo.radius !== undefined ? mo.radius : 1.6;
+		moon.shadow.intensity = 0;
+		moon.shadow.autoUpdate = false;
+		moon.shadow.needsUpdate = false;
+		moonShadowCfg = {
+			range: mo.range !== undefined ? mo.range : 60,
+			distance: mo.distance !== undefined ? mo.distance : undefined
+		};
+	} else {
+		moon.castShadow = false;
+	}
 	if (moon.target !== undefined && moon.target !== null) {
 		group.add(moon.target);
 		moon.target.position.set(0, 0, 0);
@@ -1533,10 +1968,30 @@ function createLightRig(options = {}) {
 		}, options.cycleOptions || {}));
 	cycle.sun = sun; cycle.hemi = hemi; cycle.moon = moon;
 
+	let shadowCamera = options.camera !== undefined && options.camera !== null ? options.camera : null;
+
 	return {
 		group, sun, hemi, moon, cycle,
 		setTime(hours) { cycle.setTime(hours); return this; },
-		update(dt) { cycle.update(dt); return this; },
+		/**
+		 * Привязать камеру для лунных теней (опция moonShadow): орто-фрустум
+		 * луны каждый кадр следует за камерой (followCamera + тексельный снап).
+		 */
+		bindShadowCamera(camera) { shadowCamera = camera !== undefined && camera !== null ? camera : null; return this; },
+		update(dt) {
+			cycle.update(dt);
+			if (moonShadowCfg !== null && shadowCamera !== null && moon.castShadow === true &&
+				cycle.moonIntensity > 0.01) {
+				// cycle выставил moon.position = moonDirection * sunDistance (от
+				// МИРОВОГО нуля); для followCamera на мгновение возвращаем target
+				// в ноль — направление света сохранится, а база переедет к камере.
+				if (moon.target !== undefined && moon.target !== null) moon.target.position.set(0, 0, 0);
+				moon.followCamera(shadowCamera, {
+					range: moonShadowCfg.range, distance: moonShadowCfg.distance
+				});
+			}
+			return this;
+		},
 		dispose() {
 			group.remove(sun, hemi, moon);
 			if (moon.target !== undefined && moon.target !== null) group.remove(moon.target);
@@ -1566,6 +2021,10 @@ const LightManager = class extends EventDispatcher {
 			options.pointShadowSlots !== undefined ? options.pointShadowSlots : 1);
 		this.spotShadowSlots = Math.min(this.maxSpotLights,
 			options.spotShadowSlots !== undefined ? options.spotShadowSlots : 1);
+		// v2.7: бюджет обновлений теневых карт (макс. рендеров shadow map на
+		// кадр; 0 = без лимита) и частота по умолчанию (Гц; 0 = каждый кадр).
+		this.shadowBudget = Math.max(0, options.shadowBudget !== undefined ? options.shadowBudget | 0 : 0);
+		this.defaultShadowRate = Math.max(0, options.shadowRate !== undefined ? Number(options.shadowRate) || 0 : 0);
 		this.fadeReserve = options.fadeReserve !== undefined ? options.fadeReserve : 2;
 		this.fadeTime = Math.max(1e-3, options.fadeTime !== undefined ? options.fadeTime : 0.25);
 		this.hysteresis = options.hysteresis !== undefined ? options.hysteresis : 0.2;
@@ -1580,6 +2039,7 @@ const LightManager = class extends EventDispatcher {
 		this.stats = { pointActive: 0, spotActive: 0, pointSlots: 0, spotSlots: 0, shadowUpdates: 0, ms: 0, culled: 0 };
 		this._pointSlots = [];
 		this._spotSlots = [];
+		this._shadowQueue = [];
 		this._frustum = new Frustum();
 		this._pv = new Matrix4();
 		this._hasFrustum = false;
@@ -1614,6 +2074,14 @@ const LightManager = class extends EventDispatcher {
 		}
 		if (o.pointShadowSlots !== undefined) this.pointShadowSlots = Math.max(0, o.pointShadowSlots | 0);
 		if (o.spotShadowSlots !== undefined) this.spotShadowSlots = Math.max(0, o.spotShadowSlots | 0);
+		if (o.shadowBudget !== undefined) this.shadowBudget = Math.max(0, o.shadowBudget | 0);
+		if (o.shadowRate !== undefined) {
+			this.defaultShadowRate = Math.max(0, Number(o.shadowRate) || 0);
+			for (let i = 0; i < this.entries.length; i++) {
+				const e = this.entries[i];
+				if (e._shadowRateExplicit !== true) e.shadowRate = this.defaultShadowRate;
+			}
+		}
 		this.pointShadowSlots = Math.min(this.pointShadowSlots, this.maxPointLights);
 		this.spotShadowSlots = Math.min(this.spotShadowSlots, this.maxSpotLights);
 		Object.assign(this._slotOptions, o);
@@ -1734,6 +2202,10 @@ const LightManager = class extends EventDispatcher {
 			follow: options.follow !== undefined && options.follow !== null ? options.follow : null,
 			followTarget: options.followTarget !== undefined && options.followTarget !== null ? options.followTarget : null,
 			shadow: options.shadow === true && src.shadow !== undefined && src.shadow !== null,
+			shadowRate: options.shadowRate !== undefined ? Math.max(0, Number(options.shadowRate) || 0) : this.defaultShadowRate,
+			_shadowRateExplicit: options.shadowRate !== undefined,
+			_lastShadowTime: -1e9,
+			_shadowWants: false,
 			flicker: this._resolveFlicker(options.flicker),
 			phase: options.phase !== undefined ? options.phase : Math.random(),
 			group: options.group !== undefined ? options.group : 'default',
@@ -1801,6 +2273,20 @@ const LightManager = class extends EventDispatcher {
 	setPriority(light, p) {
 		const e = this._entry(light);
 		if (e !== null) e.priority = p;
+		return this;
+	}
+
+	/**
+	 * Частота обновления теневой карты источника (Гц; 0 = каждый кадр).
+	 * Для статичных факелов/ламп достаточно 5–15 Гц —shadow map рендерится
+	 * реже, артефакты устаревания не видны (свет не двигается).
+	 */
+	setShadowRate(light, hz) {
+		const e = this._entry(light);
+		if (e !== null) {
+			e.shadowRate = Math.max(0, Number(hz) || 0);
+			e._shadowRateExplicit = true;
+		}
 		return this;
 	}
 
@@ -1950,7 +2436,7 @@ const LightManager = class extends EventDispatcher {
 		this._frame++;
 		const pointActive = this._assignSlots(this._pointSlots, 'point');
 		const spotActive = this._assignSlots(this._spotSlots, 'spot');
-		const shadowUpdates = this._countShadowUpdates();
+		const shadowUpdates = this._grantShadowUpdates();
 
 		this.stats.culled = culled;
 		this.stats.pointActive = pointActive;
@@ -2084,9 +2570,56 @@ const LightManager = class extends EventDispatcher {
 				}
 			}
 		}
-		if (on && sh.autoUpdate === false) sh.needsUpdate = true;
-		sh.autoUpdate = on;
-		if (!on) sh.needsUpdate = false;
+		// v2.7: вместо autoUpdate «каждый кадр» — планирование (rate + бюджет):
+		// _syncShadow лишь помечает ЗАПРОС обновления, реальные гранты
+		// раздаёт _grantShadowUpdates() (round-robin по времени ожидания).
+		sh.autoUpdate = false;
+		if (on !== true) { sh.needsUpdate = false; e._shadowWants = false; return; }
+		const first = (sh.map === null || sh.map === undefined);
+		const rate = e.shadowRate > 0 ? e.shadowRate : 0;
+		const due = first === true || rate <= 0 || (this.time - e._lastShadowTime) >= 1 / rate;
+		e._shadowWants = due;
+		if (due !== true) sh.needsUpdate = false;
+	}
+
+	_grantShadowUpdates() {
+		const wants = this._shadowQueue;
+		wants.length = 0;
+		const collect = (slots) => {
+			for (let i = 0; i < slots.length; i++) {
+				const s = slots[i];
+				if (s.entry !== null && s.entry._shadowWants === true) wants.push(s);
+			}
+		};
+		collect(this._pointSlots);
+		collect(this._spotSlots);
+		const time = this.time;
+		if (this.shadowBudget > 0 && wants.length > this.shadowBudget) {
+			wants.sort((a, b) => {
+				const fa = (a.light.shadow.map === null || a.light.shadow.map === undefined) ? 1 : 0;
+				const fb = (b.light.shadow.map === null || b.light.shadow.map === undefined) ? 1 : 0;
+				if (fa !== fb) return fb - fa;
+				const wa = time - a.entry._lastShadowTime;
+				const wb = time - b.entry._lastShadowTime;
+				if (Math.abs(wa - wb) > 1e-9) return wb - wa;
+				return b.entry.score - a.entry.score;
+			});
+		}
+		let granted = 0;
+		for (let i = 0; i < wants.length; i++) {
+			const s = wants[i];
+			const e = s.entry;
+			if (this.shadowBudget > 0 && granted >= this.shadowBudget) {
+				s.light.shadow.needsUpdate = false;
+				continue;
+			}
+			s.light.shadow.needsUpdate = true;
+			e._lastShadowTime = time;
+			e._shadowWants = false;
+			granted++;
+		}
+		wants.length = 0;
+		return granted;
 	}
 
 	_countShadowUpdates() {
@@ -2160,6 +2693,916 @@ const LightManager = class extends EventDispatcher {
 		}
 	}
 };
+
+// ---------------------------------------------------------------------------
+// Пресеты качества теней (v2.7 Shadow Overhaul)
+//
+// Один вызов applyShadowQuality('ultra', { rig, lights }) настраивает:
+// каскады CSM, тиры PCF-тапов, soft-режим, размеры карт солнца/луны/слотов
+// LightManager, бюджет и частоту обновлений. Пресет 'high' = прежнее
+// поведение движка по умолчанию (2 каскада × 1024, 12 тапов, без soft).
+//
+// VRAM карт солнца (depth, 4 байта/тексель, атлас = tiles × mapSize):
+//   low/medium/high: 2×1024 → 2048×1024 ≈ 8 МБ;
+//   ultra: tiles [2,1,1,1] × 1536 → 7680×1536 ≈ 47 МБ.
+// ---------------------------------------------------------------------------
+const SHADOW_QUALITY_PRESETS = {
+	low: {
+		cascades: 2, taps: 4, soft: false, fadeAllLights: true, splitLambda: 0.5,
+		sunMapSize: 1024, sunTiles: null, moonMapSize: 512,
+		dirMapSize: 512, spotMapSize: 512, pointMapSize: 256,
+		shadowBudget: 1, shadowRate: 12
+	},
+	medium: {
+		cascades: 2, taps: 8, soft: false, fadeAllLights: true, splitLambda: 0.5,
+		sunMapSize: 1024, sunTiles: null, moonMapSize: 512,
+		dirMapSize: 1024, spotMapSize: 1024, pointMapSize: 512,
+		shadowBudget: 2, shadowRate: 24
+	},
+	high: {
+		cascades: 2, taps: 12, soft: false, fadeAllLights: true, splitLambda: 0.5,
+		sunMapSize: 1024, sunTiles: null, moonMapSize: 1024,
+		dirMapSize: 1024, spotMapSize: 1024, pointMapSize: 512,
+		shadowBudget: 0, shadowRate: 0
+	},
+	ultra: {
+		cascades: 4, taps: 16, soft: { mix: 0.55, depthGrowth: 0.45, radius: 3.0 },
+		fadeAllLights: true, splitLambda: 0.6,
+		sunMapSize: 1536, sunTiles: [2, 1, 1, 1], moonMapSize: 1024,
+		dirMapSize: 2048, spotMapSize: 2048, pointMapSize: 1024,
+		shadowBudget: 0, shadowRate: 0
+	}
+};
+
+const SHADOW_QUALITY_ORDER = ['low', 'medium', 'high', 'ultra'];
+
+/**
+ * Применить пресет качества теней ко всем связанным целям.
+ *
+ * Смена каскадов/тапов/soft ПЕРЕКОМПИЛИРУЕТ пропатченные материалы (one-time
+ * фриз) — зовите на загрузке/паузе, не в бою.
+ *
+ * @param {string|object} preset Имя ('low'|'medium'|'high'|'ultra') или объект-пресет.
+ * @param {{rig?:object, sun?:THREE.Light, lights?:LightManager, directional?:THREE.DirectionalLight}} [targets]
+ *   rig — объект createLightRig (возьмёт sun и moon сам);
+ *   sun — SunLight напрямую (если rig не задан);
+ *   lights — LightManager (бюджет/частота/размеры карт слотов);
+ *   directional — одиночный DirectionalLight (размер карты).
+ * @returns {object|null} Применённый пресет (копия) или null.
+ */
+function applyShadowQuality(preset, targets = {}) {
+	const p = typeof preset === 'string' ? SHADOW_QUALITY_PRESETS[preset] : preset;
+	if (p === undefined || p === null) {
+		console.warn('ThreeForge: applyShadowQuality — неизвестный пресет: ' + preset +
+			' (ожидается ' + SHADOW_QUALITY_ORDER.join('/') + ' или объект)');
+		return null;
+	}
+	if (p.cascades !== undefined) setSunCascadeCount(p.cascades);
+	setShadowQuality({
+		taps: p.taps !== undefined ? p.taps : undefined,
+		soft: p.soft !== undefined ? p.soft : false,
+		fadeAllLights: p.fadeAllLights !== false
+	});
+
+	const rig = targets.rig !== undefined && targets.rig !== null ? targets.rig : null;
+	const sun = targets.sun !== undefined && targets.sun !== null
+		? targets.sun : (rig !== null ? rig.sun : null);
+	if (sun !== null && sun.shadow !== undefined && sun.shadow !== null) {
+		const sh = sun.shadow;
+		if (p.sunMapSize !== undefined) sh.mapSize.set(p.sunMapSize, p.sunMapSize);
+		if (p.splitLambda !== undefined && typeof sh.setSplitLambda === 'function') sh.setSplitLambda(p.splitLambda);
+		if (typeof sh.setCascadeTiles === 'function') sh.setCascadeTiles(p.sunTiles !== undefined ? p.sunTiles : null);
+		if (p.sunFade !== undefined && typeof sh.setCascadeFade === 'function') sh.setCascadeFade(p.sunFade);
+		sh.needsUpdate = true;
+	}
+
+	const moon = rig !== null && rig.moon !== undefined ? rig.moon : null;
+	if (moon !== null && moon.castShadow === true && moon.shadow !== undefined && moon.shadow !== null &&
+		p.moonMapSize !== undefined) {
+		moon.shadow.mapSize.set(p.moonMapSize, p.moonMapSize);
+		moon.shadow.needsUpdate = true;
+	}
+
+	const dir = targets.directional !== undefined && targets.directional !== null ? targets.directional : null;
+	if (dir !== null && dir.shadow !== undefined && dir.shadow !== null && p.dirMapSize !== undefined) {
+		dir.shadow.mapSize.set(p.dirMapSize, p.dirMapSize);
+		dir.shadow.needsUpdate = true;
+	}
+
+	const lights = targets.lights !== undefined && targets.lights !== null ? targets.lights : null;
+	if (lights !== null) {
+		if (p.shadowBudget !== undefined) lights.shadowBudget = Math.max(0, p.shadowBudget | 0);
+		if (p.shadowRate !== undefined) {
+			lights.defaultShadowRate = Math.max(0, Number(p.shadowRate) || 0);
+			for (let i = 0; i < lights.entries.length; i++) {
+				const e = lights.entries[i];
+				if (e._shadowRateExplicit !== true) e.shadowRate = lights.defaultShadowRate;
+			}
+		}
+		const resizeSlots = (slots, mapSize) => {
+			if (mapSize === undefined) return;
+			for (let i = 0; i < slots.length; i++) {
+				const s = slots[i];
+				if (s.shadowCapable !== true) continue;
+				const sh = s.light.shadow;
+				if (sh === undefined || sh === null) continue;
+				if (sh.mapSize.x !== mapSize || sh.mapSize.y !== mapSize) {
+					sh.mapSize.set(mapSize, mapSize);
+					if (sh.map !== null && sh.map !== undefined) { sh.map.dispose(); sh.map = null; }
+					sh.needsUpdate = true;
+				}
+			}
+		};
+		resizeSlots(lights._pointSlots, p.pointMapSize);
+		resizeSlots(lights._spotSlots, p.spotMapSize);
+	}
+	return Object.assign({}, p);
+}
+
+// ---------------------------------------------------------------------------
+// SunShadowHelper — отладочная визуализация каскадов CSM (v2.7).
+// LineSegments: боксы орто-фрустумов каждого каскада (свой цвет) + линия
+// направления света. update(camera) пересчитывает матрицы каскадов сам —
+// работает даже когда теневой проход выключен (ночь, autoUpdate=false).
+// ---------------------------------------------------------------------------
+const SSH_CASCADE_COLORS = [0x3dff88, 0xffe14d, 0xff9e4d, 0xff5c5d];
+const _sshCorners = [];
+for (let i = 0; i < 8; i++) _sshCorners.push(new Vector3());
+const _sshA = new Vector3();
+const _sshB = new Vector3();
+const _sshCenter = new Vector3();
+const _sshColor = new Color();
+
+const SunShadowHelper = class extends Group {
+	/**
+	 * @param {SunLight} sun Солнце с SunLightShadow.
+	 * @param {{colors?:number[], showDirection?:boolean, depthTest?:boolean}} [options]
+	 */
+	constructor(sun, options = {}) {
+		super();
+		this.name = 'tfSunShadowHelper';
+		this.sun = sun !== undefined && sun !== null ? sun : null;
+		this.showDirection = options.showDirection !== false;
+		this.maxCascades = 4;
+		const colors = options.colors !== undefined && options.colors !== null ? options.colors : SSH_CASCADE_COLORS;
+
+		const vertCount = this.maxCascades * 24 + 2;
+		const positions = new Float32Array(vertCount * 3);
+		const colorAttr = new Float32Array(vertCount * 3);
+		// цвета статичны: 24 вершины на каскад + 2 на направление
+		let v = 0;
+		for (let c = 0; c < this.maxCascades; c++) {
+			_sshColor.setHex(colors[c % colors.length] !== undefined ? colors[c % colors.length] : 0xffffff);
+			for (let k = 0; k < 24; k++) {
+				colorAttr[(v + k) * 3] = _sshColor.r;
+				colorAttr[(v + k) * 3 + 1] = _sshColor.g;
+				colorAttr[(v + k) * 3 + 2] = _sshColor.b;
+			}
+			v += 24;
+		}
+		_sshColor.setHex(0xffffff);
+		colorAttr[v * 3] = _sshColor.r; colorAttr[v * 3 + 1] = _sshColor.g; colorAttr[v * 3 + 2] = _sshColor.b;
+		colorAttr[(v + 1) * 3] = _sshColor.r; colorAttr[(v + 1) * 3 + 1] = _sshColor.g; colorAttr[(v + 1) * 3 + 2] = _sshColor.b;
+
+		const geometry = new BufferGeometry();
+		geometry.setAttribute('position', new BufferAttribute(positions, 3).setUsage(DYNAMIC_DRAW));
+		geometry.setAttribute('color', new BufferAttribute(colorAttr, 3));
+		geometry.setDrawRange(0, 0);
+		this._positions = positions;
+		this._geometry = geometry;
+		this._lines = new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({
+			vertexColors: true,
+			depthTest: options.depthTest === true,
+			transparent: true
+		}));
+		this._lines.renderOrder = 999;
+		this._lines.frustumCulled = false;
+		this.add(this._lines);
+		this.matrixAutoUpdate = false;
+	}
+
+	_setEdge(vi, a, b) {
+		const p = this._positions;
+		p[vi * 3] = a.x; p[vi * 3 + 1] = a.y; p[vi * 3 + 2] = a.z;
+		p[(vi + 1) * 3] = b.x; p[(vi + 1) * 3 + 1] = b.y; p[(vi + 1) * 3 + 2] = b.z;
+	}
+
+	/**
+	 * Пересчитать геометрию под текущее состояние каскадов.
+	 * @param {THREE.Camera} camera View-камера (как у рендера).
+	 */
+	update(camera) {
+		const sun = this.sun;
+		const geometry = this._geometry;
+		if (sun === null || sun.shadow === undefined || sun.shadow === null ||
+			typeof sun.shadow.updateMatrices !== 'function') {
+			geometry.setDrawRange(0, 0);
+			return this;
+		}
+		const shadow = sun.shadow;
+		if (camera !== undefined && camera !== null) {
+			sun.updateMatrixWorld(true);
+			camera.updateMatrixWorld(true);
+			shadow.updateMatrices(sun, camera);
+		}
+		const n = Math.min(this.maxCascades,
+			shadow._cascadeCount !== undefined ? shadow._cascadeCount : SUN_CASCADE_COUNT);
+		let vi = 0;
+		_sshCenter.set(0, 0, 0);
+		for (let c = 0; c < n; c++) {
+			const cam = shadow.getCamera(c);
+			if (cam === undefined || cam === null) continue;
+			for (let k = 0; k < 8; k++) {
+				_sshCorners[k].set(
+					(k & 1) ? cam.right : cam.left,
+					(k & 2) ? cam.top : cam.bottom,
+					(k & 4) ? -cam.far : -cam.near
+				).applyMatrix4(cam.matrixWorld);
+			}
+			// 12 рёбер: нижняя грань, верхняя, вертикали
+			const E = [[0, 1], [1, 3], [3, 2], [2, 0], [4, 5], [5, 7], [7, 6], [6, 4], [0, 4], [1, 5], [2, 6], [3, 7]];
+			for (let e = 0; e < 12; e++) {
+				this._setEdge(vi, _sshCorners[E[e][0]], _sshCorners[E[e][1]]);
+				vi += 2;
+			}
+			if (c === 0) {
+				_sshCenter.copy(_sshCorners[0]);
+				for (let k = 1; k < 8; k++) _sshCenter.add(_sshCorners[k]);
+				_sshCenter.multiplyScalar(1 / 8);
+			}
+		}
+		if (this.showDirection === true && n > 0) {
+			// направление света: от центра ближнего каскада вдоль -position солнца
+			_sshA.setFromMatrixPosition(sun.matrixWorld);
+			if (_sshA.lengthSq() > 1e-9) _sshA.negate().normalize();
+			else _sshA.set(0, -1, 0);
+			const cam0 = shadow.getCamera(0);
+			const len = cam0 !== undefined && cam0 !== null ? Math.max(cam0.right, 1) : 1;
+			_sshB.copy(_sshCenter).addScaledVector(_sshA, len);
+			this._setEdge(vi, _sshCenter, _sshB);
+			vi += 2;
+		}
+		geometry.setDrawRange(0, vi);
+		geometry.attributes.position.needsUpdate = true;
+		return this;
+	}
+
+	dispose() {
+		if (this._lines !== undefined) {
+			this._lines.geometry.dispose();
+			this._lines.material.dispose();
+			this.remove(this._lines);
+		}
+		return this;
+	}
+};
+/* ================================================================== */
+/* v2.8 «GAMEPLAY KIT»: стилизованные материалы, FP-контроллер,         */
+/* вьюмодель, рассеивание пропсов, парящие острова, HUD.                */
+/* ================================================================== */
+
+/** mulberry32 — компактный сидированный ГПСЧ для scatter/генераторов. */
+function tfGameRng(seed) {
+	let a = (seed >>> 0) || 1;
+	return function () {
+		a |= 0; a = (a + 0x6D2B79F5) | 0;
+		let t = Math.imul(a ^ (a >>> 15), 1 | a);
+		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+/* --- GK8: стилизованный rim-патч (toon/pbr) ------------------------- */
+
+const TF_STYLIZED_FRAG_HEAD = `
+float tfStylNdv = clamp( dot( normalize( normal ), normalize( vViewPosition ) ), 0.0, 1.0 );
+float tfStylRim = pow( 1.0 - tfStylNdv, tfStylRimPower ) * tfStylRimStrength;
+`;
+const TF_STYLIZED_FRAG_TAIL = `
+gl_FragColor.rgb += tfStylRimColor * tfStylRim;
+`;
+
+/**
+ * Rim-подсветка (френель) для любого материала с чанком <opaque_fragment>
+ * (MeshToonMaterial/MeshStandardMaterial/...): пастельный контурный свет,
+ * как у стилизованных night-сцен. Совместим с fog/shadow/sway-патчами и
+ * material.copy (патч регистрируется в tfRecordPatch).
+ * @param {THREE.Material} material
+ * @param {object} [options] rim (сила), rimPower, rimColor, uniforms (shared).
+ */
+function installStylizedPatch(material, options = {}) {
+	if (material === undefined || material === null) return material;
+	if (material.__tfStylizedPatched === true) return material;
+	const uniforms = options.uniforms !== undefined && options.uniforms !== null ? options.uniforms : {
+		tfStylRimColor: { value: new Color(options.rimColor !== undefined ? options.rimColor : 0x9db8ff) },
+		tfStylRimPower: { value: options.rimPower !== undefined ? options.rimPower : 2.6 },
+		tfStylRimStrength: { value: options.rim !== undefined ? options.rim : 0.35 }
+	};
+	material.__tfStylizedPatched = true;
+	material.__tfStylizedUniforms = uniforms;
+	tfAddProgramCacheKey(material, 'stylized');
+	tfRecordPatch(material, { name: 'stylized', replay: (copy) => installStylizedPatch(copy, Object.assign({}, options, { uniforms })) });
+	tfChainOnBeforeCompile(material, function (shader) {
+		shader.uniforms.tfStylRimColor = uniforms.tfStylRimColor;
+		shader.uniforms.tfStylRimPower = uniforms.tfStylRimPower;
+		shader.uniforms.tfStylRimStrength = uniforms.tfStylRimStrength;
+		const anchor = '#include <opaque_fragment>';
+		if (shader.fragmentShader.indexOf(anchor) === -1 || shader.fragmentShader.indexOf('#include <common>') === -1) {
+			console.warn('ThreeForge: stylized patch — нет <opaque_fragment>/<common>, материал останется без rim');
+			return;
+		}
+		const decl = 'uniform vec3 tfStylRimColor;\nuniform float tfStylRimPower;\nuniform float tfStylRimStrength;\n';
+		shader.fragmentShader = shader.fragmentShader
+			.replace('#include <common>', '#include <common>\n' + decl)
+			.replace(anchor, TF_STYLIZED_FRAG_HEAD + anchor + TF_STYLIZED_FRAG_TAIL);
+	});
+	return material;
+}
+
+/**
+ * Градиентная карта для MeshToonMaterial: ступени «toon»-освещения.
+ * @param {number|number[]} stepsOrLevels число ступеней (2..8) или массив уровней 0..1.
+ */
+function createGradientMap(stepsOrLevels, options = {}) {
+	const levels = Array.isArray(stepsOrLevels) ? stepsOrLevels.slice() : null;
+	const steps = levels !== null ? levels.length
+		: Math.max(2, Math.min(8, stepsOrLevels !== undefined ? stepsOrLevels | 0 : 3));
+	const vals = levels !== null ? levels : (() => {
+		const out = [];
+		const lo = options.floor !== undefined ? options.floor : 0.42;
+		for (let i = 0; i < steps; i++) out.push(lo + (1 - lo) * (i / (steps - 1)));
+		return out;
+	})();
+	const data = new Uint8Array(steps * 4);
+	for (let i = 0; i < steps; i++) {
+		const v = Math.round(Math.max(0, Math.min(1, vals[i])) * 255);
+		data[i * 4] = v; data[i * 4 + 1] = v; data[i * 4 + 2] = v; data[i * 4 + 3] = 255;
+	}
+	const tex = new DataTexture(data, steps, 1, RGBAFormat, UnsignedByteType);
+	tex.magFilter = THREE.NearestFilter;
+	tex.minFilter = THREE.NearestFilter;
+	tex.generateMipmaps = false;
+	tex.needsUpdate = true;
+	return tex;
+}
+
+/**
+ * Stylized-материал «как на референсе»: MeshToonMaterial (ступенчатый свет)
+ * + gradientMap + rim-френель. Дружит с туманом, тенями v2.7 и sway.
+ */
+function createStylizedMaterial(options = {}) {
+	const mat = new THREE.MeshToonMaterial({
+		color: options.color !== undefined ? options.color : 0xffffff,
+		side: options.side !== undefined ? options.side : THREE.FrontSide
+	});
+	if (options.flatShading === true) mat.flatShading = true; // define FLAT_SHADED подхватит WebGLProgram
+	if (options.opacity !== undefined) { mat.opacity = options.opacity; mat.transparent = options.opacity < 1; }
+	mat.gradientMap = options.gradientMap !== undefined && options.gradientMap !== null
+		? options.gradientMap : createGradientMap(options.steps !== undefined ? options.steps : 3);
+	if (options.emissive !== undefined) mat.emissive.set(options.emissive);
+	if (options.rim !== false) installStylizedPatch(mat, options);
+	return mat;
+}
+
+/* --- GK6: контроллер от первого лица -------------------------------- */
+
+const TF_FP_DEFAULT_KEYS = {
+	forward: 'KeyW', back: 'KeyS', left: 'KeyA', right: 'KeyD',
+	sprint: 'ShiftLeft', jump: 'Space'
+};
+const _fpDelta = new Vector2();
+
+/**
+ * Walker от первого лица: pointer-lock обзор, WASD + спринт + прыжок,
+ * гравитация и опора на terrain.heightAt/groundFn, head-bob.
+ * Головоногий: без document работает как чистая кинематика (input=null).
+ */
+const FirstPersonController = class extends EventDispatcher {
+	constructor(options = {}) {
+		super();
+		this.camera = options.camera !== undefined && options.camera !== null ? options.camera : null;
+		this.input = options.input !== undefined && options.input !== null ? options.input : null;
+		this.terrain = options.terrain !== undefined && options.terrain !== null ? options.terrain : null;
+		this.groundFn = options.groundFn !== undefined && options.groundFn !== null ? options.groundFn
+			: (this.terrain !== null ? (x, z) => this.terrain.heightAt(x, z) : null);
+		this.eyeHeight = options.eyeHeight !== undefined ? options.eyeHeight : 1.65;
+		this.speed = options.speed !== undefined ? options.speed : 4.2;
+		this.sprintSpeed = options.sprintSpeed !== undefined ? options.sprintSpeed : 7.6;
+		this.accel = options.accel !== undefined ? options.accel : 12;
+		this.gravity = options.gravity !== undefined ? options.gravity : 14;
+		this.jumpSpeed = options.jumpSpeed !== undefined ? options.jumpSpeed : 4.6;
+		this.mouseSensitivity = options.mouseSensitivity !== undefined ? options.mouseSensitivity : 0.0022;
+		this.maxPitch = options.maxPitch !== undefined ? options.maxPitch : 1.52;
+		this.headBobAmp = options.headBobAmp !== undefined ? options.headBobAmp : 0.045;
+		this.headBobFreq = options.headBobFreq !== undefined ? options.headBobFreq : 1.9;
+		this.keys = Object.assign({}, TF_FP_DEFAULT_KEYS, options.keys || {});
+		this.enabled = options.enabled !== false;
+		this.yaw = options.yaw !== undefined ? options.yaw : 0;
+		this.pitch = options.pitch !== undefined ? options.pitch : 0;
+		this.feet = new Vector3();
+		this.velocity = new Vector3();
+		this.moveAxis = new Vector2();
+		this.onGround = false;
+		this.bobPhase = 0;
+		this.bobOffset = 0;
+		this.speedRatio = 0;
+		this._jumpHeld = false;
+		this._sys = null;
+		if (this.camera !== null) {
+			this.camera.rotation.order = 'YXZ';
+			this.feet.set(this.camera.position.x, this.camera.position.y - this.eyeHeight, this.camera.position.z);
+		}
+	}
+
+	attach(engine, priority) {
+		if (this._sys !== null) this.detach(this._engine);
+		this._engine = engine;
+		this._sys = { update: (dt) => this.update(dt) };
+		engine.addSystem(this._sys, priority !== undefined ? priority : -10);
+		return this;
+	}
+
+	detach(engine) {
+		const eng = engine !== undefined && engine !== null ? engine : this._engine;
+		if (eng !== undefined && eng !== null && this._sys !== null) eng.removeSystem(this._sys);
+		this._sys = null;
+		this._engine = null;
+		return this;
+	}
+
+	lock() { if (this.input !== null) this.input.lockPointer(); return this; }
+	unlock() { if (this.input !== null) this.input.unlockPointer(); return this; }
+
+	groundHeightAt(x, z) { return this.groundFn !== null ? this.groundFn(x, z) : 0; }
+
+	teleport(x, y, z) {
+		this.feet.set(x, y !== undefined && y !== null ? y : this.groundHeightAt(x, z), z);
+		this.velocity.set(0, 0, 0);
+		this.onGround = true;
+		return this;
+	}
+
+	update(dt) {
+		if (this.enabled !== true || this.camera === null) return this;
+		const input = this.input;
+		let ax = 0, az = 0, sprint = false, jump = false;
+		if (input !== null && input.enabled !== false) {
+			if (input.pointerLocked === true) {
+				const d = input.consumeMouseDelta(_fpDelta);
+				this.yaw -= d.x * this.mouseSensitivity;
+				this.pitch -= d.y * this.mouseSensitivity;
+				const mp = this.maxPitch;
+				this.pitch = this.pitch > mp ? mp : (this.pitch < -mp ? -mp : this.pitch);
+			}
+			const k = this.keys;
+			az = (input.isKeyDown(k.forward) === true ? 1 : 0) - (input.isKeyDown(k.back) === true ? 1 : 0);
+			ax = (input.isKeyDown(k.right) === true ? 1 : 0) - (input.isKeyDown(k.left) === true ? 1 : 0);
+			sprint = input.isKeyDown(k.sprint) === true || input.isKeyDown('ShiftRight') === true;
+			jump = input.isKeyDown(k.jump) === true;
+		}
+		const sy = Math.sin(this.yaw), cy = Math.cos(this.yaw);
+		let wx = -sy * az + cy * ax;
+		let wz = -cy * az - sy * ax;
+		const wl = Math.hypot(wx, wz);
+		if (wl > 1e-5) { wx /= wl; wz /= wl; } else { wx = 0; wz = 0; }
+		const target = sprint === true ? this.sprintSpeed : this.speed;
+		const damp = Math.min(1, this.accel * dt);
+		this.velocity.x += (wx * target - this.velocity.x) * damp;
+		this.velocity.z += (wz * target - this.velocity.z) * damp;
+		if (jump === true && this.onGround === true && this._jumpHeld === false) {
+			this.velocity.y = this.jumpSpeed;
+			this.onGround = false;
+		}
+		this._jumpHeld = jump === true;
+		this.velocity.y -= this.gravity * dt;
+		this.feet.x += this.velocity.x * dt;
+		this.feet.z += this.velocity.z * dt;
+		this.feet.y += this.velocity.y * dt;
+		const g = this.groundHeightAt(this.feet.x, this.feet.z);
+		if (this.feet.y <= g + 1e-4 && this.velocity.y <= 0) {
+			this.feet.y = g;
+			this.velocity.y = 0;
+			this.onGround = true;
+		} else {
+			this.onGround = this.velocity.y <= 0.001 && this.feet.y <= g + 0.02;
+		}
+		const hs = Math.hypot(this.velocity.x, this.velocity.z);
+		this.speedRatio = Math.min(1, hs / Math.max(0.001, this.speed));
+		this.moveAxis.set(ax, az);
+		if (this.onGround === true && hs > 0.4) {
+			this.bobPhase += dt * this.headBobFreq * 6.283185307 * (0.55 + 0.45 * this.speedRatio);
+		}
+		const bobTarget = (this.onGround === true && hs > 0.4)
+			? Math.sin(this.bobPhase) * this.headBobAmp * this.speedRatio : 0;
+		this.bobOffset += (bobTarget - this.bobOffset) * Math.min(1, 10 * dt);
+		this.camera.position.set(this.feet.x, this.feet.y + this.eyeHeight + this.bobOffset, this.feet.z);
+		this.camera.rotation.set(this.pitch, this.yaw, 0);
+		return this;
+	}
+};
+
+/* --- GK7: вьюмодель (оружие/руки от первого лица) -------------------- */
+
+/**
+ * Вьюмодель: отдельная сцена, рисуемая ПОСЛЕ основной в текущий render target
+ * без очистки depth — корректная окклюзия миром и нулевой клиппинг дальних
+ * объектов. С PostPipeline встаёт в хук scenePassHook (внутрь sceneRT),
+ * без него — обёрткой engine.renderOverride.
+ */
+const ViewModel = class {
+	constructor(options = {}) {
+		this.camera = options.camera !== undefined && options.camera !== null ? options.camera : null;
+		this.scene = new THREE.Scene();
+		this.root = new Group();
+		this.scene.add(this.root);
+		this.items = [];
+		this.visible = options.visible !== false;
+		this.swayAmp = options.swayAmp !== undefined ? options.swayAmp : 0.018;
+		this.bobAmp = options.bobAmp !== undefined ? options.bobAmp : 0.012;
+		this._phase = 0;
+		this._engine = null;
+		this._prevOverride = null;
+		this._prevHook = null;
+		this._hookSet = false;
+		this._boundPass = (renderer, scene, camera) => this.renderPass(renderer, camera);
+	}
+
+	add(object, options = {}) {
+		if (object === undefined || object === null) return null;
+		const holder = new Group();
+		holder.add(object);
+		const off = options.offset !== undefined && options.offset !== null ? options.offset : null;
+		holder.position.set(
+			off !== null && off.x !== undefined ? off.x : 0.34,
+			off !== null && off.y !== undefined ? off.y : -0.36,
+			off !== null && off.z !== undefined ? off.z : -0.78);
+		if (options.rotation !== undefined && options.rotation !== null) {
+			holder.rotation.set(options.rotation.x || 0, options.rotation.y || 0, options.rotation.z || 0);
+		}
+		this.root.add(holder);
+		this.items.push({
+			holder, object,
+			base: holder.position.clone(),
+			baseRot: holder.rotation.clone(),
+			sway: options.sway !== undefined ? options.sway : 1,
+			bob: options.bob !== undefined ? options.bob : 1
+		});
+		return holder;
+	}
+
+	remove(object) {
+		for (let i = 0; i < this.items.length; i++) {
+			if (this.items[i].object === object || this.items[i].holder === object) {
+				this.root.remove(this.items[i].holder);
+				this.items.splice(i, 1);
+				return true;
+			}
+		}
+		return false;
+	}
+
+	clear() {
+		for (let i = 0; i < this.items.length; i++) this.root.remove(this.items[i].holder);
+		this.items.length = 0;
+		return this;
+	}
+
+	attach(engine) {
+		if (this._engine !== null) this.detach();
+		this._engine = engine;
+		const pipe = engine.postPipeline !== undefined && engine.postPipeline !== null ? engine.postPipeline : null;
+		if (pipe !== null) {
+			this._prevHook = pipe.scenePassHook !== undefined ? pipe.scenePassHook : null;
+			pipe.scenePassHook = this._boundPass;
+			this._hookSet = true;
+		} else {
+			this._prevOverride = engine.renderOverride;
+			const prev = this._prevOverride;
+			engine.renderOverride = (eng, dt, alpha) => {
+				if (prev !== null && prev !== undefined) prev(eng, dt, alpha);
+				else if (eng.renderer !== null && eng.scene !== null && eng.camera !== null) {
+					eng.renderer.render(eng.scene, eng.camera);
+				}
+				this.renderPass(eng.renderer, eng.camera);
+			};
+		}
+		return this;
+	}
+
+	detach() {
+		const engine = this._engine;
+		if (engine === null) return this;
+		const pipe = engine.postPipeline !== undefined && engine.postPipeline !== null ? engine.postPipeline : null;
+		if (this._hookSet === true && pipe !== null) pipe.scenePassHook = this._prevHook;
+		else engine.renderOverride = this._prevOverride;
+		this._engine = null;
+		this._hookSet = false;
+		this._prevOverride = null;
+		this._prevHook = null;
+		return this;
+	}
+
+	/** @param {object} [source] FirstPersonController или {speedRatio, bobPhase}. */
+	update(dt, source) {
+		if (this.camera !== null) {
+			this.root.position.copy(this.camera.position);
+			this.root.quaternion.copy(this.camera.quaternion);
+		}
+		const s = source !== undefined && source !== null ? source : null;
+		const ratio = s !== null && s.speedRatio !== undefined ? Math.min(1, Math.max(0, s.speedRatio)) : 0;
+		const bobPhase = s !== null && s.bobPhase !== undefined ? s.bobPhase : 0;
+		this._phase += dt * (1.6 + 2.6 * ratio);
+		const sw0 = Math.sin(this._phase * 1.7) * this.swayAmp * (0.35 + ratio);
+		const bo0 = Math.sin(bobPhase) * this.bobAmp * Math.min(1, ratio * 1.4);
+		for (let i = 0; i < this.items.length; i++) {
+			const it = this.items[i];
+			const sw = sw0 * it.sway;
+			const bo = bo0 * it.bob;
+			it.holder.position.set(it.base.x + sw, it.base.y + bo, it.base.z);
+			it.holder.rotation.set(it.baseRot.x, it.baseRot.y, it.baseRot.z + sw * 1.6);
+		}
+		return this;
+	}
+
+	renderPass(renderer, camera) {
+		const cam = camera !== undefined && camera !== null ? camera : this.camera;
+		if (this.visible !== true || this.items.length === 0) return this;
+		if (renderer === undefined || renderer === null || cam === undefined || cam === null) return this;
+		if (this.camera !== null) {
+			this.root.position.copy(this.camera.position);
+			this.root.quaternion.copy(this.camera.quaternion);
+		}
+		const prevAuto = renderer.autoClear;
+		renderer.autoClear = false;
+		renderer.render(this.scene, cam);
+		renderer.autoClear = prevAuto;
+		return this;
+	}
+};
+
+/* --- GK5: парящие объекты (острова/камни в небе) -------------------- */
+
+const FloatingProps = class {
+	constructor(options = {}) {
+		this.items = [];
+		this.time = 0;
+		this.enabled = options.enabled !== false;
+		this.timeScale = options.speed !== undefined ? options.speed : 1;
+		this._sys = null;
+		this._engine = null;
+	}
+
+	add(object, options = {}) {
+		if (object === undefined || object === null) return null;
+		const item = {
+			object,
+			base: object.position.clone(),
+			baseRot: object.rotation.clone(),
+			amp: options.amp !== undefined ? options.amp : 0.5,
+			freq: options.freq !== undefined ? options.freq : 0.06,
+			phase: options.phase !== undefined ? options.phase : Math.random() * Math.PI * 2,
+			rotSpeed: options.rotSpeed !== undefined ? options.rotSpeed : 0,
+			tilt: options.tilt !== undefined ? options.tilt : 0
+		};
+		this.items.push(item);
+		return item;
+	}
+
+	remove(object) {
+		const i = this.items.findIndex(it => it.object === object);
+		if (i !== -1) this.items.splice(i, 1);
+		return i !== -1;
+	}
+
+	clear() { this.items.length = 0; return this; }
+
+	update(dt) {
+		if (this.enabled !== true) return this;
+		this.time += dt * this.timeScale;
+		const t = this.time;
+		for (let i = 0; i < this.items.length; i++) {
+			const it = this.items[i];
+			it.object.position.y = it.base.y + Math.sin(t * it.freq * 6.283185307 + it.phase) * it.amp;
+			if (it.rotSpeed !== 0) it.object.rotation.y = it.baseRot.y + t * it.rotSpeed;
+			if (it.tilt !== 0) {
+				it.object.rotation.z = it.baseRot.z + Math.sin(t * it.freq * 4.1 + it.phase) * it.tilt;
+				it.object.rotation.x = it.baseRot.x + Math.cos(t * it.freq * 3.3 + it.phase) * it.tilt * 0.6;
+			}
+		}
+		return this;
+	}
+
+	attach(engine, priority) {
+		if (this._sys !== null) this.detach();
+		this._engine = engine;
+		this._sys = { update: (dt) => this.update(dt) };
+		engine.addSystem(this._sys, priority !== undefined ? priority : -5);
+		return this;
+	}
+
+	detach() {
+		if (this._engine !== null && this._sys !== null) this._engine.removeSystem(this._sys);
+		this._sys = null;
+		this._engine = null;
+		return this;
+	}
+};
+
+/* --- GK10: HUD-плашка (DOM) ----------------------------------------- */
+
+/**
+ * Минимальный DOM-HUD в стиле референса: плашка-подсказка снизу
+ * («ИГРА · Tab — … · Esc — …»), опциональные промпт и прицел.
+ * В headless-среде (без document) — безопасные заглушки.
+ */
+const Hud = class {
+	constructor(options = {}) {
+		this.available = typeof document !== 'undefined';
+		this.root = null;
+		this.bar = null;
+		this.prompt = null;
+		this.cross = null;
+		if (this.available !== true) return;
+		const container = options.container !== undefined && options.container !== null
+			? options.container : document.body;
+		this.root = document.createElement('div');
+		const rs = this.root.style;
+		rs.position = 'fixed'; rs.inset = '0'; rs.pointerEvents = 'none';
+		rs.zIndex = '30'; rs.userSelect = 'none';
+		rs.fontFamily = 'ui-monospace, Menlo, Consolas, monospace';
+		this.bar = document.createElement('div');
+		const bs = this.bar.style;
+		bs.position = 'absolute'; bs.left = '50%'; bs.bottom = '10px';
+		bs.transform = 'translateX(-50%)';
+		bs.background = 'rgba(24,18,30,0.72)';
+		bs.border = '1px solid rgba(255,255,255,0.35)';
+		bs.padding = '3px 10px'; bs.fontSize = '12px'; bs.color = '#f0eaf4';
+		bs.letterSpacing = '0.4px'; bs.whiteSpace = 'nowrap';
+		this.prompt = document.createElement('div');
+		const ps = this.prompt.style;
+		ps.position = 'absolute'; ps.left = '50%'; ps.top = '58%';
+		ps.transform = 'translateX(-50%)';
+		ps.background = 'rgba(24,18,30,0.66)';
+		ps.border = '1px solid rgba(255,255,255,0.28)';
+		ps.padding = '6px 12px'; ps.fontSize = '14px'; ps.color = '#ffffff';
+		ps.display = 'none';
+		this.cross = document.createElement('div');
+		const cs = this.cross.style;
+		cs.position = 'absolute'; cs.left = '50%'; cs.top = '50%';
+		cs.width = '4px'; cs.height = '4px'; cs.margin = '-2px 0 0 -2px';
+		cs.borderRadius = '50%'; cs.background = 'rgba(255,255,255,0.8)';
+		cs.display = 'none';
+		this.root.appendChild(this.bar);
+		this.root.appendChild(this.prompt);
+		this.root.appendChild(this.cross);
+		container.appendChild(this.root);
+		this.setHints(options.hints !== undefined ? options.hints : [], options.title !== undefined ? options.title : 'ИГРА');
+		if (options.crosshair === true) this.setCrosshair(true);
+	}
+
+	setHints(hints, title) {
+		if (this.available !== true) return this;
+		const parts = [title !== undefined && title !== null ? title : 'ИГРА'].concat(hints || []).filter(Boolean);
+		this.bar.textContent = parts.join(' · ');
+		this.bar.style.display = parts.length > 0 ? 'block' : 'none';
+		return this;
+	}
+
+	setPrompt(text) {
+		if (this.available !== true) return this;
+		if (text === undefined || text === null || text === '') this.prompt.style.display = 'none';
+		else { this.prompt.textContent = String(text); this.prompt.style.display = 'block'; }
+		return this;
+	}
+
+	setCrosshair(on) {
+		if (this.available !== true) return this;
+		this.cross.style.display = on === true ? 'block' : 'none';
+		return this;
+	}
+
+	dispose() {
+		if (this.available !== true) return this;
+		if (this.root !== null && this.root.parentNode !== null) this.root.parentNode.removeChild(this.root);
+		this.root = this.bar = this.prompt = this.cross = null;
+		return this;
+	}
+};
+
+/* --- GK4: рассеивание пропсов --------------------------------------- */
+
+/**
+ * Детерминированное инстанс-рассеивание пропсов (мечи, камни, декор):
+ * случайные позиции в круге/rect с маской плотности, наклон/масштаб/yaw,
+ * чанки InstancedMesh для frustum culling.
+ * @returns {{group: THREE.Group, meshes: THREE.InstancedMesh[], count: number, dispose: Function}}
+ */
+function scatterProps(options = {}) {
+	const geometry = options.geometry !== undefined && options.geometry !== null ? options.geometry : null;
+	const material = options.material !== undefined && options.material !== null ? options.material : null;
+	if (geometry === null || material === null) {
+		throw new Error('ThreeForge: scatterProps — нужны options.geometry и options.material');
+	}
+	const rnd = tfGameRng(options.seed !== undefined ? options.seed : 1);
+	const count = Math.max(1, options.count !== undefined ? options.count | 0 : 64);
+	const center = options.center !== undefined && options.center !== null ? options.center : { x: 0, z: 0 };
+	const radius = options.radius !== undefined ? options.radius : 60;
+	const bounds = options.bounds !== undefined && options.bounds !== null ? options.bounds : null;
+	const heightFn = options.heightFn !== undefined && options.heightFn !== null ? options.heightFn
+		: (options.terrain !== undefined && options.terrain !== null ? (x, z) => options.terrain.heightAt(x, z) : null);
+	const scaleRange = options.scale !== undefined && options.scale !== null ? options.scale : [1, 1];
+	const scaleMin = Array.isArray(scaleRange) ? scaleRange[0] : scaleRange;
+	const scaleMax = Array.isArray(scaleRange) ? (scaleRange[1] !== undefined ? scaleRange[1] : scaleRange[0]) : scaleRange;
+	const tiltMax = options.tiltMax !== undefined ? options.tiltMax : 0.12;
+	const sink = options.sink !== undefined ? options.sink : 0;
+	let br = options.baseRotation !== undefined && options.baseRotation !== null ? options.baseRotation : null;
+	if (Array.isArray(br)) br = { x: br[0] || 0, y: br[1] || 0, z: br[2] || 0 };
+	const densityFn = options.densityFn !== undefined && options.densityFn !== null ? options.densityFn : null;
+	const chunkSize = options.chunkSize !== undefined ? options.chunkSize : 0;
+
+	const placed = [];
+	let guard = 0;
+	while (placed.length < count && guard < count * 12) {
+		guard++;
+		let x, z;
+		if (bounds !== null) {
+			x = bounds.minX + rnd() * (bounds.maxX - bounds.minX);
+			z = bounds.minZ + rnd() * (bounds.maxZ - bounds.minZ);
+		} else {
+			const r = Math.sqrt(rnd()) * radius;
+			const a = rnd() * Math.PI * 2;
+			x = center.x + Math.cos(a) * r;
+			z = center.z + Math.sin(a) * r;
+		}
+		if (densityFn !== null) {
+			const d = Math.max(0, Math.min(1, densityFn(x, z)));
+			if (rnd() > d) continue;
+		}
+		const s0 = scaleMin + rnd() * Math.max(0, scaleMax - scaleMin);
+		// heightFn может принимать масштаб инстанса третьим аргументом (F3):
+		// позволяет «воткнуть» меч на нужную высоту над землёй.
+		const y = heightFn !== null ? heightFn(x, z, s0) : 0;
+		placed.push({
+			x, y: y - sink, z,
+			s: s0,
+			rx: (rnd() * 2 - 1) * tiltMax,
+			rz: (rnd() * 2 - 1) * tiltMax,
+			ry: rnd() * Math.PI * 2
+		});
+	}
+
+	const buckets = new Map();
+	for (let i = 0; i < placed.length; i++) {
+		const p = placed[i];
+		const key = chunkSize > 0
+			? Math.floor(p.x / chunkSize) + ',' + Math.floor(p.z / chunkSize) : 'all';
+		let arr = buckets.get(key);
+		if (arr === undefined) { arr = []; buckets.set(key, arr); }
+		arr.push(p);
+	}
+
+	const group = new Group();
+	const meshes = [];
+	const m4 = new Matrix4();
+	const q = new Quaternion();
+	const eu = new THREE.Euler();
+	const vP = new Vector3();
+	const vS = new Vector3();
+	const bx = br !== null ? (br.x || 0) : 0;
+	const by = br !== null ? (br.y || 0) : 0;
+	const bz = br !== null ? (br.z || 0) : 0;
+	for (const arr of buckets.values()) {
+		const mesh = new InstancedMesh(geometry, material, arr.length);
+		for (let i = 0; i < arr.length; i++) {
+			const p = arr[i];
+			eu.set(p.rx + bx, p.ry + by, p.rz + bz);
+			q.setFromEuler(eu);
+			vP.set(p.x, p.y, p.z);
+			vS.setScalar(p.s);
+			m4.compose(vP, q, vS);
+			mesh.setMatrixAt(i, m4);
+		}
+		mesh.instanceMatrix.needsUpdate = true;
+		mesh.castShadow = options.castShadow !== false;
+		mesh.receiveShadow = options.receiveShadow !== false;
+		mesh.computeBoundingSphere();
+		meshes.push(mesh);
+		group.add(mesh);
+	}
+	return {
+		group,
+		meshes,
+		count: placed.length,
+		dispose() {
+			for (let i = 0; i < meshes.length; i++) {
+				group.remove(meshes[i]);
+				meshes[i].dispose();
+			}
+			meshes.length = 0;
+		}
+	};
+}
+
 
 const TF_EMISSIVE_TIME = { value: 0 };
 
@@ -4409,6 +5852,19 @@ const TERRAIN_GRASS_B = new Color(0.36, 0.42, 0.22);
 const Terrain = class {
 	constructor(options = {}) {
 		this.seed = options.seed || 0;
+		// F4: кастомные веса типов scatter (null = палитра v2.7)
+		this.scatterWeights = null;
+		if (options.scatterWeights !== undefined && options.scatterWeights !== null) {
+			const entries = Object.entries(options.scatterWeights).filter(e => e[1] > 0);
+			const total = entries.reduce((a, e) => a + e[1], 0);
+			if (total > 0) {
+				let acc = 0;
+				this.scatterWeights = entries.map(e => {
+					acc += e[1] / total;
+					return { t: e[0], c: acc };
+				});
+			}
+		}
 		this.scale = options.scale !== undefined ? options.scale : 0.004;
 		this.amplitude = options.amplitude !== undefined ? options.amplitude : 40;
 		this.octaves = options.octaves !== undefined ? options.octaves : 5;
@@ -4653,6 +6109,11 @@ const Terrain = class {
 		return out;
 	}
 
+	/**
+	 * Веса типов растительности для scatter() (F4): по умолчанию — палитра v2.7
+	 * (tree/rock/bush/grass). Передайте options.scatterWeights {type: weight},
+	 * чтобы добавить свои типы (например 'flower'): веса нормализуются.
+	 */
 	scatter(chunkX, chunkZ, size, count = 512) {
 		const rand = createPRNG(chunkX * 73856093 ^ chunkZ * 19349663 ^ this.seed);
 		const items = [];
@@ -4668,7 +6129,13 @@ const Terrain = class {
 			if (1 - nrm.y > 0.32) continue;
 			const pick = rand();
 			let type;
-			if (pick < 0.14) type = 'tree';
+			const w = this.scatterWeights;
+			if (w !== null) {
+				type = w[w.length - 1].t;
+				for (let k = 0; k < w.length; k++) {
+					if (pick < w[k].c) { type = w[k].t; break; }
+				}
+			} else if (pick < 0.14) type = 'tree';
 			else if (pick < 0.24) type = 'rock';
 			else if (pick < 0.44) type = 'bush';
 			else type = 'grass';
@@ -6325,6 +7792,9 @@ uniform vec3 uRaysTint;
 uniform float uRaysStrength;
 uniform float uSharpen;
 uniform vec2 uTexel;
+uniform float uVignette;
+uniform float uSaturation;
+uniform vec3 uTint;
 varying vec2 vTfUv;
 void main() {
 	vec3 c = texture2D( tColor, vTfUv ).rgb;
@@ -6337,6 +7807,12 @@ void main() {
 		c += ( c - n ) * uSharpen;
 	}
 	c += texture2D( tRays, vTfUv ).rgb * uRaysTint * uRaysStrength;
+	if ( uVignette > 0.0 ) {
+		vec2 tfVg = vTfUv - 0.5;
+		c *= 1.0 - uVignette * clamp( dot( tfVg, tfVg ) * 2.2, 0.0, 1.0 );
+	}
+	c = mix( vec3( dot( c, vec3( 0.2126, 0.7152, 0.0722 ) ) ), c, uSaturation );
+	c *= uTint;
 	gl_FragColor = vec4( c, 1.0 );
 	#include <colorspace_fragment>
 	gl_FragColor.rgb += ( fract( 52.9829189 * fract( dot( gl_FragCoord.xy, vec2( 0.06711056, 0.00583715 ) ) ) ) - 0.5 ) * ( 1.0 / 255.0 );
@@ -6444,6 +7920,20 @@ const PostPipeline = class extends THREE.EventDispatcher {
 			tint: new THREE.Color(1.0, 0.62, 0.28)
 		}, options.godRays || {});
 		this.sunDirection = options.sunDirection !== undefined ? options.sunDirection : null;
+
+		// GK9: кино-грейд финального пасса (по умолчанию нейтрален = поведение v2.7).
+		this.gradeOptions = Object.assign({
+			vignette: 0,
+			saturation: 1,
+			tint: new Color(1, 1, 1)
+		}, options.grade || {});
+		// tint мог прийти числом/строкой через options.grade — нормализуем в Color (F1)
+		if (this.gradeOptions.tint === null || this.gradeOptions.tint === undefined ||
+			this.gradeOptions.tint.isColor !== true) {
+			this.gradeOptions.tint = new Color(this.gradeOptions.tint);
+		}
+		// GK7: хук вьюмодели — вызывается ПОСЛЕ рендера сцены в текущий RT.
+		this.scenePassHook = options.scenePassHook !== undefined ? options.scenePassHook : null;
 
 	this.bloomOptions = Object.assign({
 		enabled: false,
@@ -6694,7 +8184,10 @@ const PostPipeline = class extends THREE.EventDispatcher {
 				uRaysTint: { value: this.raysOptions.tint.clone() },
 				uRaysStrength: { value: 0 },
 				uSharpen: { value: this.taaOptions.sharpen },
-				uTexel: { value: new THREE.Vector2() }
+				uTexel: { value: new THREE.Vector2() },
+				uVignette: { value: this.gradeOptions.vignette },
+				uSaturation: { value: this.gradeOptions.saturation },
+				uTint: { value: this.gradeOptions.tint.clone() }
 			},
 			vertexShader: TF_FS_VERT,
 			fragmentShader: TF_FINAL_FRAG,
@@ -6737,6 +8230,26 @@ const PostPipeline = class extends THREE.EventDispatcher {
 		}
 	}
 
+	/** GK9: кино-цветокоррекция финального пасса: {vignette 0..1, saturation, tint}. */
+	setGrade(options = {}) {
+		const g = this.gradeOptions;
+		if (options.vignette !== undefined) g.vignette = options.vignette;
+		if (options.saturation !== undefined) g.saturation = options.saturation;
+		if (options.tint !== undefined) {
+			g.tint.copy(options.tint !== null && options.tint.isColor === true ? options.tint : new Color(options.tint));
+		}
+		this._syncGrade();
+		return this;
+	}
+
+	_syncGrade() {
+		const g = this.gradeOptions;
+		const u = this.finalMat.uniforms;
+		u.uVignette.value = g.vignette;
+		u.uSaturation.value = g.saturation;
+		u.uTint.value.copy(g.tint);
+	}
+
 	attach(engine) {
 		if (this._engine !== null) this.detach();
 		if (engine === undefined || engine === null) {
@@ -6745,6 +8258,7 @@ const PostPipeline = class extends THREE.EventDispatcher {
 		}
 		this._engine = engine;
 		this._prevOverride = engine.renderOverride;
+		engine.postPipeline = this;
 		this._boundRender = () => this.render();
 		engine.renderOverride = this._boundRender;
 		if (engine.renderer !== null && engine.renderer !== undefined) {
@@ -6762,6 +8276,7 @@ const PostPipeline = class extends THREE.EventDispatcher {
 		const engine = this._engine;
 		if (engine === null) return this;
 		engine.renderOverride = this._prevOverride;
+		if (engine.postPipeline === this) engine.postPipeline = null;
 		if (engine.renderer !== null && engine.renderer !== undefined) {
 			engine.renderer.info.autoReset = this._prevAutoReset;
 		}
@@ -7089,6 +8604,7 @@ const PostPipeline = class extends THREE.EventDispatcher {
 		if (this.enabled === false) {
 			renderer.setRenderTarget(null);
 			renderer.render(scene, camera);
+			if (this.scenePassHook !== null) this.scenePassHook(renderer, scene, camera);
 			return;
 		}
 
@@ -7155,6 +8671,7 @@ const PostPipeline = class extends THREE.EventDispatcher {
 		let t0 = this.profile ? _tfNow() : 0;
 		renderer.setRenderTarget(this.sceneRT);
 		renderer.render(scene, camera);
+		if (this.scenePassHook !== null) this.scenePassHook(renderer, scene, camera);
 		if (this.profile) this.stats.msScene = _tfNow() - t0;
 
 		if (taaOn) camera.projectionMatrix.copy(this._projClean);
@@ -7360,6 +8877,7 @@ const PostPipeline = class extends THREE.EventDispatcher {
 	}
 
 	_finalBlit(colorTex, rays) {
+		this._syncGrade();
 		const u = this.finalMat.uniforms;
 		u.tColor.value = colorTex;
 		u.tRays.value = this.rtRaysB !== null ? this.rtRaysB.texture : null;
@@ -8870,7 +10388,15 @@ const TerrainStreamer = class extends THREE.EventDispatcher {
 			palette: this.terrain._palRGB
 		};
 		for (let i = 0; i < this.workers; i++) {
-			const w = new Worker(this._workerUrl);
+			let w;
+			try {
+				w = new Worker(this._workerUrl);
+			} catch (err) {
+				// F2: Chrome на file:// бросает синхронный SecurityError для blob-воркеров
+				console.warn('ThreeForge: TerrainStreamer — Worker недоступен (' + ((err && err.message) || err) + '), переход на sync-сборку');
+				this.workers = 0;
+				break;
+			}
 			const entry = { worker: w, busy: false, ready: false, failed: false };
 			w.onmessage = (e) => this._onWorkerMessage(entry, e.data);
 			w.onerror = (e) => {
@@ -10076,20 +11602,162 @@ function createGrassGeometry(options = {}) {
 function createDetailMaterial(type, options = {}) {
 	const mat = new THREE.MeshLambertMaterial({
 		vertexColors: true,
-		side: type === 'grass' ? DoubleSide : THREE.FrontSide
+		side: (type === 'grass' || type === 'flower') ? DoubleSide : THREE.FrontSide
 	});
 	mat.name = 'tfDetail_' + type;
+	// F5: слабый emissive — стилизованный «светящийся» ковёр (цветы/трава) ночью
+	if (options.emissive !== undefined && options.emissive !== null) mat.emissive.set(options.emissive);
 	if (options.fog !== undefined && options.fog !== null) installFogPatch(mat, options.fog);
 	return mat;
 }
+
+/* --- GK1: процедурный низполи-меч ----------------------------------- */
+
+/**
+ * Стилизованный меч: 4-гранный клинок с остриём, перекрестье, рукоять, навершие.
+ * Начало координат — перекрестье (точка хвата); клинок направлен +Y.
+ * Для «воткнутых» гигантских мечей в scatterProps используйте baseRotation.
+ */
+function createSwordGeometry(options = {}) {
+	const bladeLength = options.bladeLength !== undefined ? options.bladeLength : 1.05;
+	const bladeWidth = options.bladeWidth !== undefined ? options.bladeWidth : 0.085;
+	const bladeThickness = options.bladeThickness !== undefined ? options.bladeThickness : 0.022;
+	const guardWidth = options.guardWidth !== undefined ? options.guardWidth : 0.34;
+	const guardHeight = options.guardHeight !== undefined ? options.guardHeight : 0.045;
+	const guardDepth = options.guardDepth !== undefined ? options.guardDepth : 0.035;
+	const gripLength = options.gripLength !== undefined ? options.gripLength : 0.24;
+	const gripRadius = options.gripRadius !== undefined ? options.gripRadius : 0.019;
+	const pommelRadius = options.pommelRadius !== undefined ? options.pommelRadius : 0.045;
+	const bladeColor = new Color(options.bladeColor !== undefined ? options.bladeColor : 0xb9c2cf);
+	const guardColor = new Color(options.guardColor !== undefined ? options.guardColor : 0x6b5a33);
+	const gripColor = new Color(options.gripColor !== undefined ? options.gripColor : 0x3a2b22);
+	const parts = [];
+	const straight = bladeLength * 0.78;
+	const squash = bladeThickness / bladeWidth;
+	const blade = new THREE.CylinderGeometry(bladeWidth * 0.72, bladeWidth, straight, 4, 1, false);
+	blade.rotateY(Math.PI / 4);
+	blade.scale(1, 1, squash);
+	blade.translate(0, straight * 0.5, 0);
+	_tfColorize(blade, bladeColor);
+	parts.push(blade);
+	const tipH = bladeLength - straight;
+	const tip = new THREE.ConeGeometry(bladeWidth * 0.72, tipH, 4, 1, false);
+	tip.rotateY(Math.PI / 4);
+	tip.scale(1, 1, squash);
+	tip.translate(0, straight + tipH * 0.5, 0);
+	_tfColorize(tip, bladeColor);
+	parts.push(tip);
+	const guard = new THREE.BoxGeometry(guardWidth, guardHeight, guardDepth);
+	guard.translate(0, -guardHeight * 0.5, 0);
+	_tfColorize(guard, guardColor);
+	parts.push(guard);
+	const grip = new THREE.CylinderGeometry(gripRadius, gripRadius * 1.12, gripLength, 6, 1, false);
+	grip.translate(0, -guardHeight - gripLength * 0.5, 0);
+	_tfColorize(grip, gripColor);
+	parts.push(grip);
+	const pommel = new THREE.IcosahedronGeometry(pommelRadius, 0);
+	pommel.translate(0, -guardHeight - gripLength - pommelRadius * 0.6, 0);
+	_tfColorize(pommel, guardColor);
+	parts.push(pommel);
+	const geo = _tfMergeGeometries(parts);
+	for (let i = 0; i < parts.length; i++) parts[i].dispose();
+	geo.computeBoundingSphere();
+	return geo;
+}
+
+/* --- GK2: стилизованный кулак для вьюмодели ------------------------- */
+
+/**
+ * Низполи-кулак (перчатка): ладонь, блок пальцев, большой палец, манжета.
+ * Ориентация: пальцы -Z, тыльная сторона +Z (под хват вертикальной рукояти).
+ */
+function createFistGeometry(options = {}) {
+	const s = options.scale !== undefined ? options.scale : 1;
+	const skin = new Color(options.color !== undefined ? options.color : 0xc9a186);
+	const cuffColor = new Color(options.cuffColor !== undefined ? options.cuffColor : 0x4a3a2c);
+	const parts = [];
+	const palm = new THREE.BoxGeometry(0.085, 0.095, 0.105);
+	_tfColorize(palm, skin);
+	parts.push(palm);
+	const fingers = new THREE.BoxGeometry(0.082, 0.052, 0.075);
+	fingers.translate(0, 0.028, -0.062);
+	_tfColorize(fingers, skin);
+	parts.push(fingers);
+	const thumb = new THREE.BoxGeometry(0.03, 0.062, 0.036);
+	thumb.rotateZ(-0.5);
+	thumb.translate(-0.055, 0.012, -0.03);
+	_tfColorize(thumb, skin);
+	parts.push(thumb);
+	const wrist = new THREE.CylinderGeometry(0.036, 0.042, 0.09, 6, 1, false);
+	wrist.rotateX(Math.PI / 2);
+	wrist.translate(0, -0.01, 0.085);
+	_tfColorize(wrist, skin);
+	parts.push(wrist);
+	const cuff = new THREE.CylinderGeometry(0.05, 0.056, 0.05, 6, 1, false);
+	cuff.rotateX(Math.PI / 2);
+	cuff.translate(0, -0.012, 0.115);
+	_tfColorize(cuff, cuffColor);
+	parts.push(cuff);
+	const geo = _tfMergeGeometries(parts);
+	for (let i = 0; i < parts.length; i++) parts[i].dispose();
+	geo.scale(s, s, s);
+	geo.computeBoundingSphere();
+	return geo;
+}
+
+/* --- GK3: цветок для поля деталей ----------------------------------- */
+
+/**
+ * Низполи-цветок: стебель (2 перекрещённых квада, как у травы), головка
+ * из petal-квадов и сердцевина. Вершинные цвета — под vertexColors деталей;
+ * качание совместимо с installSwayPatch (маска по position.y).
+ */
+function createFlowerGeometry(options = {}) {
+	const rnd = tfGameRng(options.seed !== undefined ? options.seed : 11);
+	const petals = Math.max(4, options.petals !== undefined ? options.petals | 0 : 5);
+	const headR = options.headRadius !== undefined ? options.headRadius : 0.05;
+	const stemH = options.stemHeight !== undefined ? options.stemHeight : 0.22;
+	const stemColor = new Color(options.stemColor !== undefined ? options.stemColor : 0x4d6b3a);
+	const petalColor = new Color(options.petalColor !== undefined ? options.petalColor : 0xe8e4f2);
+	const centerColor = new Color(options.centerColor !== undefined ? options.centerColor : 0xe9c86a);
+	const parts = [];
+	for (let i = 0; i < 2; i++) {
+		const q = new THREE.PlaneGeometry(0.016, stemH, 1, 2);
+		q.translate(0, stemH * 0.5, 0);
+		q.rotateY(i * Math.PI / 2);
+		_tfColorize(q, stemColor);
+		parts.push(q);
+	}
+	for (let i = 0; i < petals; i++) {
+		const a = (i / petals) * Math.PI * 2 + rnd() * 0.3;
+		const p = new THREE.PlaneGeometry(headR * 0.95, headR * 1.25, 1, 1);
+		p.translate(0, headR * 0.62, 0);
+		p.rotateX(-0.9);
+		p.rotateY(a);
+		p.translate(0, stemH, 0);
+		_tfColorize(p, petalColor);
+		parts.push(p);
+	}
+	const c = new THREE.PlaneGeometry(headR * 0.8, headR * 0.8);
+	c.rotateX(-Math.PI / 2);
+	c.translate(0, stemH + headR * 0.18, 0);
+	_tfColorize(c, centerColor);
+	parts.push(c);
+	const geo = _tfMergeGeometries(parts);
+	for (let i = 0; i < parts.length; i++) parts[i].dispose();
+	geo.computeBoundingSphere();
+	return geo;
+}
+
 
 const TF_DETAIL_DEFAULTS = {
 	tree: { enabled: true, maxRing: 4, density: 1, castShadow: true, pageSize: 1024, budget: 12000, scale: 1, sway: { strength: 0.06, speed: 1.05, freq: 0.22, maskHeight: 3.6 } },
 	rock: { enabled: true, maxRing: 5, density: 1, castShadow: true, pageSize: 1024, budget: 8000, scale: 1, sway: null },
 	bush: { enabled: true, maxRing: 2, density: 1, castShadow: true, pageSize: 2048, budget: 16000, scale: 0.9, sway: { strength: 0.08, speed: 1.7, freq: 0.5, maskHeight: 0.9 } },
-	grass: { enabled: true, maxRing: 1, density: 1, castShadow: false, pageSize: 4096, budget: 40000, scale: 1, sway: { strength: 0.11, speed: 2.4, freq: 0.85, maskHeight: 0.6 } }
+	grass: { enabled: true, maxRing: 1, density: 1, castShadow: false, pageSize: 4096, budget: 40000, scale: 1, sway: { strength: 0.11, speed: 2.4, freq: 0.85, maskHeight: 0.6 } },
+	flower: { enabled: true, maxRing: 2, density: 1, castShadow: false, pageSize: 4096, budget: 30000, scale: 1, sway: { strength: 0.09, speed: 2.0, freq: 0.7, maskHeight: 0.35 } }
 };
-const TF_DETAIL_TYPES = ['tree', 'rock', 'bush', 'grass'];
+const TF_DETAIL_TYPES = ['tree', 'rock', 'bush', 'grass', 'flower'];
 
 const _tdMat4 = new Matrix4();
 const _tdQuat = new Quaternion();
@@ -10175,12 +11843,13 @@ const TerrainDetailManager = class extends EventDispatcher {
 				geometry = type === 'tree' ? createTreeGeometry()
 					: type === 'rock' ? createRockGeometry({ seed: this.seed + 7 })
 						: type === 'bush' ? createBushGeometry({ seed: this.seed + 17 })
-							: createGrassGeometry({ seed: this.seed + 3 });
+							: type === 'flower' ? createFlowerGeometry({ seed: this.seed + 29 })
+								: createGrassGeometry({ seed: this.seed + 3 });
 				this._owned.push(geometry);
 			}
 			let material = mats[type] !== undefined && mats[type] !== null ? mats[type] : null;
 			if (material === null) {
-				material = createDetailMaterial(type, { fog: options.fog !== undefined ? options.fog : null });
+				material = createDetailMaterial(type, { fog: options.fog !== undefined ? options.fog : null, emissive: cfg.emissive });
 				this._owned.push(material);
 				if (cfg.sway !== null) {
 					const sway = Object.assign({}, cfg.sway);
@@ -10206,7 +11875,8 @@ const TerrainDetailManager = class extends EventDispatcher {
 		this._popQueue = [];
 		this._queuedKeys = new Set();
 		this._dirty = false;
-		this.stats = { chunks: 0, queued: 0, tree: 0, rock: 0, bush: 0, grass: 0 };
+		this.stats = { chunks: 0, queued: 0 };
+		for (let i = 0; i < TF_DETAIL_TYPES.length; i++) this.stats[TF_DETAIL_TYPES[i]] = 0;
 
 		this._boundBuilt = (e) => this._onChunkBuilt(e.chunk);
 		this._boundRemoved = (e) => this._onChunkRemoved(e.chunk);
@@ -10301,7 +11971,8 @@ const TerrainDetailManager = class extends EventDispatcher {
 
 	_populateNow(cx, cz, key) {
 		const ring = this.ringOf(cx, cz);
-		const rec = { ring, tree: null, rock: null, bush: null, grass: null };
+		const rec = { ring };
+		for (let i = 0; i < TF_DETAIL_TYPES.length; i++) rec[TF_DETAIL_TYPES[i]] = null;
 		this._items.set(key, rec);
 		const items = this.scatterFn(cx, cz, this.chunkSize, this.scatterCount);
 		const added = this._addTypes(cx, cz, rec, ring, items, null);
@@ -10942,7 +12613,8 @@ function createTerrainSystem(options = {}) {
 		octaves: tOpts.octaves !== undefined ? tOpts.octaves : options.octaves,
 		ridgeMix: tOpts.ridgeMix !== undefined ? tOpts.ridgeMix : options.ridgeMix,
 		waterLevel: tOpts.waterLevel !== undefined ? tOpts.waterLevel : options.waterLevel,
-		palette: tOpts.palette !== undefined ? tOpts.palette : options.palette
+		palette: tOpts.palette !== undefined ? tOpts.palette : options.palette,
+		scatterWeights: tOpts.scatterWeights !== undefined ? tOpts.scatterWeights : options.scatterWeights
 	});
 
 	const sOpts = options.streamer !== undefined && options.streamer !== null ? options.streamer : {};
@@ -12217,6 +13889,12 @@ export {
 	Engine, InstancedBatcher, CullGroup,
 	SunLight, SunLightShadow, PointLight, SunCycle,
 	SUN_CASCADE_COUNT, SUN_CASCADE_FADE,
+	getSunCascadeCount, setSunCascadeCount,
+	getShadowQuality, setShadowQuality,
+	SHADOW_QUALITY_PRESETS, SHADOW_QUALITY_ORDER, applyShadowQuality,
+	SunShadowHelper,
+	FirstPersonController, ViewModel, FloatingProps, Hud,
+	installStylizedPatch, createStylizedMaterial, createGradientMap,
 	installSunShadowPatch, TF_SUN_SHADOW_FN, TF_SHADOW_UNIFORMS,
 	tfAddProgramCacheKey, tfRecordPatch, tfChainOnBeforeCompile, cloneMaterialPatched,
 	DirectionalLight, SpotLight, LightManager, LIGHT_FLICKER, tfFlickerValue,
@@ -12258,6 +13936,7 @@ export {
 	createTerrainDetailUniforms, installTerrainDetailPatch, createTerrainMaterial,
 	TF_SWAY_TIME, TF_SWAY_GLSL, TF_SWAY_VERT, installSwayPatch,
 	createTreeGeometry, createRockGeometry, createBushGeometry, createGrassGeometry,
+	createSwordGeometry, createFistGeometry, createFlowerGeometry, scatterProps,
 	createDetailMaterial, TF_DETAIL_DEFAULTS, TF_DETAIL_TYPES, TerrainDetailManager,
 	TF_WATER_WAVES_GLSL, TF_WATER_VERT, TF_WATER_FRAG, TF_WATER_DEFAULT_WAVES,
 	createShoreHeightTexture, WaterSurface,

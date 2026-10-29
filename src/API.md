@@ -3,7 +3,17 @@
 Единый **ESM-модуль** для **three.js r186** (единственный импорт — `three`, других зависимостей нет).
 Файл: `threeforge-v2_6_0.js`. Все системы **опциональны**: подключайте только то, что нужно.
 
-**Экспортов: 167** — 35 классов, 37 функций, 39 GLSL-чанков, 56 констант/пресетов.
+**Экспортов: 186** — 40 классов, 49 функций, 39 GLSL-чанков, 58 констант/пресетов.
+
+> **v2.7 Shadow Overhaul**: каскады 1–4 (`setSunCascadeCount`), тиры PCF и soft-режим
+> (`setShadowQuality`), пресеты (`applyShadowQuality`), лунные тени, бюджет обновлений
+> `LightManager`, отладочный `SunShadowHelper`. Дефолты совпадают с v2.6 — см. [CHANGELOG.md](CHANGELOG.md).
+
+> **v2.8 Gameplay Kit**: стилизованный toon-материал с rim (`createStylizedMaterial`),
+> FP-контроллер (`FirstPersonController`), вьюмодель (`ViewModel`), рассеивание пропсов
+> (`scatterProps`), процедурные меч/кулак/цветок, тип детали `flower`, парящие объекты
+> (`FloatingProps`), DOM-`Hud`, кино-грейд `PostPipeline` (виньетка/насыщенность/тон).
+> Дефолты нейтральны — см. [CHANGELOG.md](CHANGELOG.md). Демо: `examples/sword-field.html`.
 
 > Сопутствующие документы: [QUICKSTART.md](QUICKSTART.md) — рабочие примеры интеграции;
 > [CHANGELOG.md](CHANGELOG.md) — история исправлений (метки T/L/R/S/N/M в комментариях кода).
@@ -15,6 +25,7 @@
 - [Часть 1: ядро](#часть-1-ядро)
 - [Часть 1.5: свет и тени](#часть-15-свет-и-тени)
 - [Часть 1.55: гигиена шейдерных патчей](#часть-155-гигиена-шейдерных-патчей)
+- [Часть 1.58: Gameplay Kit (v2.8)](#часть-158-gameplay-kit-v28)
 - [Часть 1.6: источники света, LightManager, emissive](#часть-16-источники-света-lightmanager-emissive)
 - [Часть 1.75: туман](#часть-175-туман)
 - [Часть 1.9: частицы и погода](#часть-19-частицы-и-погода)
@@ -78,7 +89,7 @@ import { Engine, createLightRig, PhysicsWorld } from 'threeforge';
 ## Обзор экспортов
 
 - **часть 1: ядро** (3): `Engine`, `InstancedBatcher`, `CullGroup`
-- **часть 1.5: свет и тени** (9): `SunLight`, `SunLightShadow`, `PointLight`, `SunCycle`, `SUN_CASCADE_COUNT`, `SUN_CASCADE_FADE`, `installSunShadowPatch`, `TF_SUN_SHADOW_FN`, `TF_SHADOW_UNIFORMS`
+- **часть 1.5: свет и тени** (17): `SunLight`, `SunLightShadow`, `PointLight`, `SunCycle`, `SUN_CASCADE_COUNT`, `SUN_CASCADE_FADE`, `getSunCascadeCount`, `setSunCascadeCount`, `getShadowQuality`, `setShadowQuality`, `SHADOW_QUALITY_PRESETS`, `SHADOW_QUALITY_ORDER`, `applyShadowQuality`, `SunShadowHelper`, `installSunShadowPatch`, `TF_SUN_SHADOW_FN`, `TF_SHADOW_UNIFORMS`
 - **часть 1.55: гигиена шейдерных патчей** (4): `tfAddProgramCacheKey`, `tfRecordPatch`, `tfChainOnBeforeCompile`, `cloneMaterialPatched`
 - **часть 1.6: источники света, LightManager, emissive** (14): `DirectionalLight`, `SpotLight`, `LightManager`, `LIGHT_FLICKER`, `tfFlickerValue`, `createLightRig`, `installEmissivePatch`, `applyEmissiveOptions`, `EmissiveManager`, `TF_EMISSIVE_GLSL`, `TF_EMISSIVE_TIME`, `createEmissiveTexture`, `createEmissiveMaterial`, `EMISSIVE_TEXTURE_KINDS`
 - **часть 1.75: туман** (5): `FogManager`, `installFogPatch`, `TF_FOG_GLSL`, `FOG_PRESETS`, `FOG_PRESET_ORDER`
@@ -199,9 +210,9 @@ P5: скретч вместо matrixWorld.clone()
 
 *extends `Light`; строка 716*
 
-SunLight — солнце: параллельные лучи, направление = normalize(position) (светит из position в начало координат; target не нужен). Тени — два каскада SunLightShadow, подгоняются под камеру сцены автоматически. ИСПРАВЛЕНО (L3): dispose() теперь вызывает super.dispose() — Light наследует его от Object3D (dispatchEvent 'dispose'), как и в эталонном examples/jsm/lights/SunLight.js. Прежний комментарий («у Light в этом бандле его нет») относился к минифицированной сборке и устарел.
+SunLight — солнце: параллельные лучи, направление = normalize(position) (светит из position в начало координат; target не нужен). Тени — каскады SunLightShadow (v2.7: 1–4, настраиваются глобально setSunCascadeCount или per-shadow через shadowOptions.cascades), подгоняются под камеру сцены автоматически. ИСПРАВЛЕНО (L3): dispose() теперь вызывает super.dispose() — Light наследует его от Object3D (dispatchEvent 'dispose'), как и в эталонном examples/jsm/lights/SunLight.js. Прежний комментарий («у Light в этом бандле его нет») относился к минифицированной сборке и устарел.
 
-**Конструктор:** `new SunLight(color, intensity)`
+**Конструктор:** `new SunLight(color, intensity, shadowOptions)` — `shadowOptions` передаётся в `SunLightShadow` (`cascades`, `splitLambda`, `cascadeFade`, `cascadeTiles`).
 
 **Методы:**
 
@@ -213,20 +224,35 @@ SunLight — солнце: параллельные лучи, направлен
 
 ### SunLightShadow
 
-*extends `LightShadow`; строка 580*
+*extends `LightShadow`*
 
-доля глубины каскада, уходящая в бленд
+Каскадные тени солнца (CSM) поверх атласа: N фрустумов-срезов view-камеры упакованы в одну карту (`mapSize` = размер ОДНОГО каскада; атлас = mapSize × сумма тайлов). v2.7: число каскадов, схема сплитов, фейд и веса тайлов настраиваются; дефолты покадрово эквивалентны эталону three (examples/jsm/lights/SunLightShadow).
 
-**Конструктор:** `new SunLightShadow()`
+**Конструктор:** `new SunLightShadow(options)`
+
+| Опция | По умолчанию | Описание |
+|---|---|---|
+| `cascades` | `getSunCascadeCount()` | Число каскадов 1..4. |
+| `splitLambda` | `0.5` | Схема сплитов: 0 = логарифмическая, 1 = равномерная, 0.5 = среднее (эталон). |
+| `cascadeFade` | `0.1` | Доля глубины каскада, растворяющаяся в следующем (0.02..0.9). |
+| `cascadeTiles` | `null` | Веса каскадов в атласе: `[2,1,1,1]` — ближний вдвое детальнее; null = по 1. |
 
 **Методы:**
 
 | Сигнатура | Описание |
 |---|---|
+| `setCascadeCount(n)` | Число каскадов 1..4 (пересоздаёт камеры/атлас; карта будет пересобрана). |
+| `getCascadeCount()` |  |
+| `setSplitLambda(x)` | Схема сплитов: 0 = логарифмическая, 1 = равномерная (дефолт 0.5). |
+| `setCascadeFade(f)` | Доля глубины каскада, растворяющаяся в следующем (0.02..0.9). |
+| `setCascadeTiles(tiles)` | Веса каскадов в атласе ([2,1,1,1] — ближний вдвое детальнее); null = по 1. |
 | `getCamera(cascadeIndex = 0)` |  |
 | `getMatrix(cascadeIndex = 0)` |  |
 | `getFrustum(cascadeIndex = 0)` |  |
 | `updateMatrices(light, viewCamera)` | viewCamera — камера, которой рендерится сцена (срезы её frustum'а). |
+| `copy(source, recursive)` | Переносит в т.ч. splitLambda/cascadeFade/cascadeTiles/число каскадов. |
+| `toJSON()` | + cascades, splitLambda, cascadeFade, cascadeTiles. |
+| `dispose()` | Снимает тень с глобального реестра (setSunCascadeCount её больше не трогает). |
 
 ### PointLight
 
@@ -263,7 +289,7 @@ PointLight — точечный источник. ИСПРАВЛЕНО/ДОРА�
 
 *extends `EventDispatcher`; строка 939*
 
-SunCycle — директор времени суток. Считает положение/палитру солнца, луны и неба для часа time ∈ [0..24) и записывает результат в связанные цели (всё опционально, null = не трогать): sun (SunLight), hemi (HemisphereLight), moon (DirectionalLight без теней), fogColor (общий Color тумана/фона/горизонта), skyUniforms, waterUniforms. Ночью sun.shadow.autoUpdate выключается — shadow-проход не рендерится (экономию даёт без рекомпиляции программ: состав источников не меняется). sunDirection/moonDirection/sunColor — ЖИВЫЕ объекты: можно отдавать их напрямую в value униформ (uSunDir.value =…
+SunCycle — директор времени суток. Считает положение/палитру солнца, луны и неба для часа time ∈ [0..24) и записывает результат в связанные цели (всё опционально, null = не трогать): sun (SunLight), hemi (HemisphereLight), moon (DirectionalLight; v2.7 — опционально с тенями), fogColor (общий Color тумана/фона/горизонта), skyUniforms, waterUniforms. v2.7: вместо булева порога — ПЛАВНЫЕ shadow.intensity солнца и луны по высоте светила (поля shadowFactor/moonShadowFactor): ночью застывшая карта заката больше не сэмплируется (интенсивность 0), рассвет/закат без щелчка; shadow-проход по-прежнему выключается (экономия без рекомпиляции программ). sunDirection/moonDirection/sunColor — ЖИВЫЕ объекты: можно отдавать их напрямую в value униформ (uSunDir.value =…
 
 **`new SunCycle(options)`**
 
@@ -284,6 +310,8 @@ SunCycle — директор времени суток. Считает поло
 | `waterUniforms` | `null` | — |
 | `lights` | — | часть 1.6: LightManager (или любой объект с setDayFactor) |
 
+**Поля состояния (читаются после update):** `dayFactor`, `nightFactor`, `sunsetFactor`, `sunIntensity`, `hemiIntensity`, `moonIntensity`, `elevation`, **v2.7:** `shadowFactor` (0 ночь → 1 день; пишется в `sun.shadow.intensity`), `moonShadowFactor` (наоборот).
+
 **Методы:**
 
 | Сигнатура | Описание |
@@ -299,23 +327,70 @@ SunCycle — директор времени суток. Считает поло
 
 ### installSunShadowPatch(material)
 
-*строка 906*
+Патчит материал для теней (v2.7 — генерируемый GLSL под текущие настройки качества): CSM-выбор каскада `SunLight` (цикл на ЛЮБОЕ число каскадов), N-таповый Vogel-PCF с footprint-клампом и temporal-ротацией (`tfShadowRot`), soft-режим (второе широкое кольцо, `tfShadowSoft`), фейд теней по туману (`tfShadowFade`) — для солнца И (опция `fadeAllLights`, вкл. по умолчанию) для directional/spot/point через обёртку `tfFadeShadow(<call>, -geometryPosition.z)`. Компонуется с туманом/дизером/emissive; ключ кэша программ — динамический (число каскадов + тапы + soft + fadeAll), поэтому смена `setShadowQuality`/`setSunCascadeCount` не переиспользует молча старую программу. Патч корректен при ЛЮБОМ `renderer.shadowMap.type` (PCF/PCFSoft → Vogel; Basic/VSM → встроенный getShadow того же типа сэмплера).
 
-Патчит материал для CSM-теней `SunLight`: выбор каскада, temporal PCF-ротация (`tfShadowRot`) и фейд теней по туману (`tfShadowFade`) через общие униформы `TF_SHADOW_UNIFORMS`.
+### getSunCascadeCount() / setSunCascadeCount(n)
+
+Число каскадов CSM — ГЛОБАЛЬНОЕ свойство шейдера (define `SUN_LIGHT_CASCADES` в чанке three задаёт размеры униформ-массивов), одно на рендерер; диапазон 1..4 (дефолт 2). `setSunCascadeCount(n)`:
+1. переопределяет define в `ShaderChunk.shadowmap_pars_fragment` — ВСЕ программы, скомпилированные после вызова, согласованы (включая нативный `getSunShadow` и shadowmask);
+2. переконфигурирует все живые `SunLightShadow` (реестр);
+3. помечает материалы с TF-патчем на рекомпиляцию (реестр WeakRef).
+
+Программы, скомпилированные ДО вызова, пересобираются через `material.needsUpdate = true` — меняйте каскады на старте/загрузке, не в бою.
+
+### getShadowQuality() / setShadowQuality(q)
+
+Глобальные настройки фильтрации теней (для всех материалов с патчем):
+
+| Поле | По умолчанию | Описание |
+|---|---|---|
+| `taps` | `12` | Vogel-тапов PCF на кольцо (1..64; 12 = прежнее поведение v2.6). |
+| `soft` | `false` | Второе «широкое» кольцо (×2 стоимость сэмплинга, только SHADOWMAP_TYPE_PCF). |
+| `softMix` | `0.55` | Базовая доля широкого кольца (униформа, без рекомпиляции). |
+| `softDepthGrowth` | `0.45` | Прирост доли на view-глубину (÷ tfShadowFade.y) — дальние тени мягче (contact hardening-аппроксимация). |
+| `softRadius` | `3.0` | Радиус широкого кольца в радиусах узкого (1..12). |
+| `fadeAllLights` | `true` | Растворять в дымке тени directional/spot/point (v2.6: только солнце). |
+
+Смена `taps`/`soft`/`fadeAllLights` перегенерирует GLSL и помечает пропатченные материалы на рекомпиляцию (one-time фриз); `softMix`/`softDepthGrowth`/`softRadius` — униформы (мгновенно). `soft` принимает также объект: `{ enabled, mix, depthGrowth, radius }`.
+
+### applyShadowQuality(preset, targets)
+
+Применить пресет ко всем целям одним вызовом: каскады + тапы + soft + размеры карт солнца/луны/directional + слоты `LightManager` (mapSize/budget/rate). Возвращает копию пресета или null.
+
+**`targets`:** `{ rig, sun, lights, directional }` (всё опционально; rig возьмёт sun/moon сам).
+
+| Пресет | cascades | taps | soft | sun map | atlas | budget/rate |
+|---|---|---|---|---|---|---|
+| `low` | 2 | 4 | — | 1024 | 2048×1024 (~8 МБ) | 1 / 12 Гц |
+| `medium` | 2 | 8 | — | 1024 | 2048×1024 (~8 МБ) | 2 / 24 Гц |
+| `high` | 2 | 12 | — | 1024 | 2048×1024 (~8 МБ) | без лимита (= v2.6) |
+| `ultra` | 4 | 16 | mix 0.55 | 1536, tiles [2,1,1,1] | 7680×1536 (~47 МБ) | без лимита |
+
+### SunShadowHelper(sun, options)
+
+*extends `Group`*
+
+Отладочная визуализация CSM: wireframe-боксы орто-фрустумов каскадов (свой цвет на каскад) + линия направления света. `update(camera)` пересчитывает матрицы каскадов сам — работает и когда теневой проход выключен (ночь/autoUpdate=false). Добавляйте в сцену, зовите `update(camera)` каждый кадр (или системой Engine), `dispose()` по окончании.
+
+**Опции:** `colors` (массив hex по каскадам, дефолт зелёный→жёлтый→оранжевый→красный), `showDirection` (true), `depthTest` (false — рисовать поверх геометрии).
+
+**Методы:** `update(camera)`, `dispose()`.
 
 #### Константы и пресеты
 
 | Имя | Значение / состав | Описание |
 |---|---|---|
-| `SUN_CASCADE_COUNT` | `2` | — |
-| `SUN_CASCADE_FADE` | `0.1` | должно совпадать с SUN_LIGHT_CASCADES в шейдере |
-| `TF_SHADOW_UNIFORMS` | ключи: `tfShadowRot`, `tfShadowFade` | tfShadowFade по туману; без пайплайна дефолты = статичные тени без фейда. |
+| `SUN_CASCADE_COUNT` | `2` | Дефолтное число каскадов (экспорт для совместимости; фактическое — getSunCascadeCount()). |
+| `SUN_CASCADE_FADE` | `0.1` | Дефолтная доля фейда каскада. |
+| `SHADOW_QUALITY_PRESETS` | ключи: `low`, `medium`, `high`, `ultra` | Данные пресетов (см. applyShadowQuality). |
+| `SHADOW_QUALITY_ORDER` | `['low','medium','high','ultra']` | Порядок пресетов (для UI «качество теней»). |
+| `TF_SHADOW_UNIFORMS` | ключи: `tfShadowRot`, `tfShadowFade`, `tfShadowSoft` | Общие униформы: rot/fade пишет PostPipeline, soft — setShadowQuality; без пайплайна дефолты = статичные тени без фейда. |
 
 #### GLSL-чанки (шейдерный код)
 
 | Имя | Значение / состав | Описание |
 |---|---|---|
-| `TF_SUN_SHADOW_FN` | GLSL, ~5 КБ | — |
+| `TF_SUN_SHADOW_FN` | GLSL, генерируется | Текущая сгенерированная функция теней (live-binding: обновляется setShadowQuality). |
 
 ---
 
@@ -353,6 +428,123 @@ SunCycle — директор времени суток. Считает поло
 @param {THREE.Material} material
 @returns {THREE.Material} Клон с теми же патчами.
 ```
+
+---
+
+## Часть 1.58: Gameplay Kit (v2.8)
+
+Набор для игр «от первого лица» в стилизованной графике (референс — ночное поле мечей).
+Все системы независимы и ничего не меняют по умолчанию.
+
+### FirstPersonController
+
+Walker от первого лица: pointer-lock обзор, WASD, спринт, прыжок, гравитация, опора на
+`groundFn`/`terrain.heightAt`, head-bob. Без `document`/`input` — чистая кинематика (тестируется headless).
+
+```js
+const input = new InputManager(renderer.domElement);
+const ctl = new FirstPersonController({
+  camera, input,
+  groundFn: (x, z) => world.groundHeight(x, z), // или terrain: <Terrain>
+  speed: 4.4, sprintSpeed: 8.2, eyeHeight: 1.65,
+  gravity: 14, jumpSpeed: 4.6, accel: 12,
+  mouseSensitivity: 0.0022, maxPitch: 1.52,
+  headBobAmp: 0.045, headBobFreq: 1.9,
+  keys: { forward: 'KeyW', /* back/left/right/sprint/jump */ }
+});
+ctl.attach(engine);              // система с priority -10
+canvas.onclick = () => ctl.lock();
+```
+
+Поля состояния: `feet`, `velocity`, `onGround`, `yaw/pitch`, `speedRatio`, `moveAxis`,
+`bobPhase`, `bobOffset` (их читает вьюмодель). Методы: `teleport(x, y?, z)`, `lock()/unlock()`,
+`groundHeightAt(x, z)`, `attach(engine)/detach()`, `update(dt)`.
+
+### ViewModel
+
+Оружие/руки от первого лица: отдельная сцена, рисуется ПОСЛЕ основной **в тот же render
+target без clearDepth** — корректная окклюзия миром, нулевой клиппинг дальних объектов.
+С `PostPipeline` автоматически встаёт в хук `scenePassHook` (внутрь `sceneRT`, т.е. под
+bloom/AO/TAA), без него — обёрткой `engine.renderOverride`.
+
+```js
+const vm = new ViewModel({ camera, swayAmp: 0.02, bobAmp: 0.014 });
+const fist = new THREE.Mesh(createFistGeometry(), skinMat);
+fist.add(new THREE.Mesh(createSwordGeometry({ bladeLength: 0.92 }), bladeMat));
+vm.add(fist, { offset: { x: 0.3, y: -0.33, z: -0.62 }, rotation: { x: 0.22, y: -0.42, z: 0.12 } });
+vm.attach(engine);                              // после post.attach(engine)
+engine.addSystem({ update: dt => vm.update(dt, ctl) }, 50); // sway/bob от контроллера
+```
+
+Методы: `add(object, {offset, rotation, sway, bob}) → holder`, `remove(obj)`, `clear()`,
+`attach/detach`, `update(dt, source?)`, `renderPass(renderer, camera)` (вручную не нужен).
+
+### scatterProps(options)
+
+Детерминированный (по `seed`) инстанс-разброс пропсов с чанками для frustum culling:
+
+```js
+const swords = scatterProps({
+  geometry: createSwordGeometry(), material: giantMat,
+  count: 52, seed: 5, radius: 150, chunkSize: 64,   // или bounds: {minX..maxZ}, center
+  heightFn: (x, z, scale) => ground(x, z) + scale * 0.62, // 3-й аргумент — масштаб инстанса (F3)
+  // или terrain: <Terrain>
+  scale: [7, 15], tiltMax: 0.24, sink: 1.4,
+  baseRotation: [Math.PI, 0, 0],                     // «остриём в землю»
+  densityFn: (x, z) => nearSpawn(x, z) ? 0 : 1,      // маска плотности 0..1
+  castShadow: true, receiveShadow: true
+});
+scene.add(swords.group);
+// → { group, meshes: InstancedMesh[], count, dispose() }
+```
+
+### FloatingProps
+
+Парящие острова/камни: `add(object, {amp, freq, phase, rotSpeed, tilt})`, `remove`, `clear`,
+`update(dt)`; `attach(engine)` (priority -5). Bob по sin, медленное вращение и наклон.
+
+### Stylized-материалы
+
+- `createGradientMap(stepsOrLevels, {floor})` — ступени toon-освещения (NearestFilter).
+- `installStylizedPatch(material, {rim, rimPower, rimColor})` — rim-френель для любого
+  материала с `<opaque_fragment>` (toon/standard/physical); совместим с fog/shadow/sway
+  и `cloneMaterialPatched` (uniforms разделяются оригиналом и клоном).
+- `createStylizedMaterial({color, steps: 3, rim, rimColor, rimPower, flatShading, side,
+  emissive, gradientMap})` — MeshToonMaterial + gradientMap + rim. «rim: false» — без патча.
+
+### Процедурные геометрии (низполи)
+
+| Функция | Что делает | Начало координат |
+|---|---|---|
+| `createSwordGeometry({bladeLength: 1.05, bladeWidth, bladeThickness, guardWidth, gripLength, pommelRadius, *Color})` | меч: 4-гранный клинок с остриём, перекрестье, рукоять, навершие | перекрестье; клинок +Y |
+| `createFistGeometry({scale, color, cuffColor})` | кулак-перчатка для вьюмодели | центр ладони |
+| `createFlowerGeometry({petals: 5, headRadius, stemHeight, seed, *Color})` | цветок: стебель-крест, лепестки, сердцевина | основание стебля |
+
+### Тип детали `flower`
+
+`TF_DETAIL_TYPES` теперь `['tree', 'rock', 'bush', 'grass', 'flower']`. В
+`TerrainDetailManager`/`createTerrainSystem` цветы настраиваются как прочие типы:
+`details: { types: { flower: { density: 1.6, budget: 26000, emissive: 0x39325a } } }`
+(sway maskHeight 0.35, emissive — F5). Чтобы цветы вообще сеялись, задайте веса типов
+террейна (F4): `terrain: { scatterWeights: { tree: 0.02, rock: 0.06, bush: 0.06, grass: 0.44, flower: 0.42 } }`
+— дефолт без `scatterWeights` = палитра v2.7 (tree/rock/bush/grass).
+
+### Hud (DOM)
+
+```js
+const hud = new Hud({ title: 'ИГРА', hints: ['Tab — вернуться в конструктор', 'Esc — меню игры'], crosshair: false });
+hud.setPrompt('Клик — захват мыши'); // центральная плашка
+hud.setCrosshair(true); hud.dispose();
+```
+
+В headless-среде (`document === undefined`) `hud.available === false`, все методы безопасны.
+
+### PostPipeline grade (GK9)
+
+Финальный пасс: `grade: { vignette: 0..1, saturation, tint }` (конструктор или
+`post.setGrade({...})`); по умолчанию нейтрален (0/1/белый). Плюс хук
+`post.scenePassHook(renderer, scene, camera)` — вызывается после рендера сцены в текущий
+RT (его занимает `ViewModel`; при ручной установке зовите свой коллбэк сами).
 
 ---
 
@@ -436,6 +628,8 @@ LightManager — бюджет источников света. ЗАЧЕМ. three
 | `hysteresis` | `0.2` | — |
 | `defaultRange` | `24` | — |
 | `globalIntensity` | `1` | — |
+| `shadowBudget` | `0` | v2.7: макс. рендеров теневых карт на кадр (0 = без лимита); round-robin по времени ожидания, первый рендер карты — вне бюджета. |
+| `shadowRate` | `0` | v2.7: частота обновления теней по умолчанию, Гц (0 = каждый кадр); для статичных факелов достаточно 5–15. |
 | `profile` | `false` | — |
 | `enabled` | `true` | — |
 | `scene` | — | — |
@@ -445,7 +639,7 @@ LightManager — бюджет источников света. ЗАЧЕМ. three
 
 | Сигнатура | Описание |
 |---|---|
-| `setBudget(maxPoint, maxSpot, o = {})` | Изменить бюджет источников «на лету» (смена уровня графики, настройка). |
+| `setBudget(maxPoint, maxSpot, o = {})` | Изменить бюджет источников «на лету» (смена уровня графики, настройка). v2.7: `o.shadowBudget`, `o.shadowRate` — без пересоздания слотов. |
 | `setScene(scene)` | Привязать сцену (пул слотов создаётся один раз). |
 | `add(light, options = {})` | Зарегистрировать источник. |
 | `remove(light)` | Снять источник с регистрации (слот освобождается на следующем кадре). |
@@ -454,6 +648,7 @@ LightManager — бюджет источников света. ЗАЧЕМ. three
 | `setIntensity(light, v)` |  |
 | `setRange(light, range)` |  |
 | `setPriority(light, p)` |  |
+| `setShadowRate(light, hz)` | v2.7: частота обновления теневой карты источника (Гц; 0 = каждый кадр). Опция `shadowRate` есть и у `add(light, options)`. |
 | `setFlicker(light, preset)` | Мерцание: |
 | `setGroupEnabled(group, on)` | Массовое включение/выключение группы (например, 'torches'). |
 | `setDayFactor(f)` | 0 = ночь, 1 = день. |
@@ -463,7 +658,7 @@ LightManager — бюджет источников света. ЗАЧЕМ. three
 | `restoreAll()` | Сбросить все слоты и бленды (смена сцены/уровня, телепорт камеры). |
 | `dispose()` |  |
 
-*Приватные (`_…`, не часть публичного контракта): 9 — `_buildSlots`, `_resolveFlicker`, `_entry`, `_assignSlots`, `_syncShadow`, `_countShadowUpdates`, `_countShadowIn`, `_clearSlots`, `_disposeSlots`*
+*Приватные (`_…`, не часть публичного контракта): 10 — `_buildSlots`, `_resolveFlicker`, `_entry`, `_assignSlots`, `_syncShadow`, `_grantShadowUpdates`, `_countShadowUpdates`, `_countShadowIn`, `_clearSlots`, `_disposeSlots`*
 
 ### EmissiveManager
 
@@ -505,11 +700,17 @@ EmissiveManager — время и транзиенты свечения. Дер�
 ```
 createLightRig — готовый риг дневного цикла.
 Собирает SunLight (CSM-тени) + HemisphereLight (небо/земля) + DirectionalLight
-(луна, без теней) и SunCycle, который ими управляет. Всё кладётся в Group,
-чтобы игра добавляла в сцену один объект. Group ДОЛЖНА стоять в начале
-координат: SunLight вычисляет направление из МИРОВОЙ позиции.
+(луна; v2.7 — опционально С тенями) и SunCycle, который ими управляет. Всё
+кладётся в Group, чтобы игра добавляла в сцену один объект. Group ДОЛЖНА
+стоять в начале координат: SunLight вычисляет направление из МИРОВОЙ позиции.
 @param {THREE.Scene} [options.scene] Куда добавить group (иначе — вручную).
-@returns {{group, sun, hemi, moon, cycle, setTime, update, dispose}}
+@param {THREE.Camera} [options.camera] Камера для лунных теней (или rig.bindShadowCamera позже).
+@param {boolean|object} [options.moonShadow] v2.7: лунные тени — true или
+  { mapSize=1024, range=60, distance, bias, normalBias, radius }.
+  castShadow включается СРАЗУ (NUM_DIR_LIGHT_SHADOWS стабилен → без
+  рекомпиляций в рантайме); ночью SunCycle включает autoUpdate и
+  followCamera(range) вокруг камеры, днём проход теней не рендерится.
+@returns {{group, sun, hemi, moon, cycle, setTime, update, bindShadowCamera, dispose}}
 ```
 
 ### installEmissivePatch(material, options = {})

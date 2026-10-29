@@ -8,6 +8,92 @@
 `threeforge-engine.js` (части 1–2: ядро и игровой мир) и `threeforge-advanced.js` (часть 3: продвинутый
 рендеринг и оптимизация). Все системы опциональны; имена экспортов не менялись между версиями.
 
+## v2.8 — Gameplay Kit (игровой набор; аддитивно, дефолты = v2.7):
+
+- **GK1** `createSwordGeometry` — процедурный низполи-меч (4-гранный клинок с остриём и
+  долом, перекрестье, рукоять, навершие; вершинные цвета; начало координат — перекрестье).
+- **GK2** `createFistGeometry` — стилизованный кулак-перчатка для вьюмодели.
+- **GK3** `createFlowerGeometry` + новый тип детали `flower` (палитра, sway, бюджет) —
+  плотные «поля цветов» через TerrainDetailManager/createTerrainSystem.
+- **GK4** `scatterProps` — детерминированное инстанс-рассеивание пропсов (seed, радиус/
+  bounds, маска плотности, масштаб/наклон/yaw, sink, baseRotation, чанки InstancedMesh
+  с корректными boundingSphere для frustum culling, dispose).
+- **GK5** `FloatingProps` — парящие острова/камни: bob, медленное вращение, наклон;
+  attach в Engine.
+- **GK6** `FirstPersonController` — walker от первого лица: pointer-lock обзор (через
+  InputManager), WASD+спринт+прыжок, гравитация и опора на terrain.heightAt/groundFn,
+  head-bob, edge-детект прыжка, clamp pitch, teleport; headless-безопасен (input=null →
+  чистая кинематика, покрыт тестами).
+- **GK7** `ViewModel` — оружие/руки от первого лица: отдельная сцена, рендер ПОСЛЕ
+  основной в тот же RT без clearDepth (корректная окклюзия, нет клиппинга); с
+  PostPipeline — через новый хук `scenePassHook` (внутри sceneRT, под bloom/AO/TAA),
+  без него — обёртка `engine.renderOverride`; sway/bob от FirstPersonController;
+  `attach/detach` восстанавливают предыдущее состояние (включая чужой хук).
+  `PostPipeline.attach` теперь ставит `engine.postPipeline` (detach — снимает).
+- **GK8** `createGradientMap`, `installStylizedPatch` (rim-френель для любого материала
+  с `<opaque_fragment>`; совместим с fog/shadow/sway-патчами и cloneMaterialPatched),
+  `createStylizedMaterial` (MeshToonMaterial + gradientMap + rim).
+- **GK9** PostPipeline: кино-грейд финального пасса `grade: {vignette, saturation, tint}`
+  + `setGrade()`; по умолчанию нейтрален (поведение v2.7). Синхронизация каждый кадр
+  (`gradeOptions` можно менять напрямую).
+- **GK10** `Hud` — DOM-плашка подсказок («ИГРА · Tab — … · Esc — …»), промпт, прицел;
+  без `document` — безопасные заглушки.
+- Тесты: `tools/dev/smoke-game.mjs` (99 проверок, входит в `npm run smoke` и отдельным
+  `npm run game`); GLSL-матрица расширена до 49 комбинаций (toon+rim+fog+CSM, standard+rim,
+  final+grade). Демо: `examples/sword-field.html` + `tools/dev/serve.mjs` (статик-сервер).
+- `tools/dev/build-standalone.mjs` (+ `npm run standalone`): single-file сборка демо —
+  `examples/sword-field-standalone.html` (three core+module + движок + демо одним
+  классическим `<script>`; работает с file://; встроенные проверки: acorn + headless-прогон).
+- Фиксы запуска/визуала демо (F1–F5), найдены headless-браузером (puppeteer):
+  - **F1** `PostPipeline`: `grade.tint` числом/строкой в конструкторе падал с
+    «tint.clone is not a function» и ронял весь скрипт — нормализуется в `Color`.
+  - **F2** `TerrainStreamer`: `new Worker(blob:)` в Chrome на `file://` бросает
+    синхронный SecurityError — обёрнуто в try/catch с переходом на sync-сборку
+    (single-file демо теперь реально открывается с диска).
+  - **F3** `scatterProps`: `heightFn(x, z, scale)` — третий аргумент позволяет
+    «воткнуть» меч остриём в землю на нужную высоту (гарда над землёй).
+  - **F4** `Terrain`: `options.scatterWeights {type: weight}` — настраиваемая
+    палитра типов scatter (дефолт = v2.7); пробрасывается через createTerrainSystem;
+    без неё тип `flower` не сеялся вовсе.
+  - **F5** `createDetailMaterial`: `emissive` (и `types.*.emissive` у менеджера) —
+    ночной «светящийся» ковёр цветов; плюс type-agnostic stats/records менеджера
+    деталей (ранее rec/stats создавались только для 4 старых типов → крах на flower).
+  - Демо: палитра ночи (zenith/horizon/hemi), fill-hemi, PCFShadowMap (PCFSoft удалён
+    в r186), парящие острова в секторе взгляда, `window.__tf` для отладки.
+- Экспорты: 175 → 186 (+11). Имя файла и прежние API не менялись.
+
+## v2.7 — Shadow Overhaul (глубокая переработка теней; аддитивно, дефолты = v2.6):
+
+- **SH1** SunLightShadow: конфигурируемые каскады — `setSunCascadeCount(1..4)` (глобально: override
+  define `SUN_LIGHT_CASCADES` в чанке three + реестр живых теней + авто-рекомпиляция пропатченных
+  материалов), `splitLambda` (0 = логарифмические сплиты, 1 = равномерные, 0.5 = прежнее поведение),
+  `cascadeFade`, `cascadeTiles` (веса каскадов в атласе: `[2,1,1,1]` — ближний каскад вдвое детальнее);
+  эквивалентность дефолтов эталону three проверена покадрово (матрицы/вьюпорты/cascadeData);
+- **SH2** Качество фильтрации: GLSL теперь ГЕНЕРИРУЕТСЯ под настройки — `setShadowQuality({taps, soft,
+  fadeAllLights})`: тиры Vogel-тапов 1..64 (дефолт 12 = v2.6), soft-режим (второе широкое PCF-кольцо
+  с усилением по дальности — аппроксимация contact hardening, униформа `tfShadowSoft`); динамический
+  ключ кэша программ (`tfShadowCacheKey.toString()`) — смена настроек даёт новую программу, а не
+  молчаливое переиспользование старой;
+- **SH3** Единый туманный фейд: `tfFadeShadow` оборачивает тени directional/spot/point (раньше
+  растворялись только тени солнца) — дальние тени всех источников уходят в дымку вместе с `tfShadowFade`;
+- **SH4** SunCycle: фикс «застывшей ночи» — вместо булева порога `sunIntensity > 0.05` плавный
+  `shadow.intensity` по высоте солнца (`shadowFactor`): ночью застывшая карта заката больше не
+  сэмплируется (интенсивность 0), рассвет/закат без щелчка; `water.uShadowFade` — из той же кривой;
+- **SH5** Лунные тени: `createLightRig({moonShadow: true|{mapSize, range, ...}})` + `bindShadowCamera(camera)` —
+  `castShadow` включён сразу (NUM_DIR_LIGHT_SHADOWS стабилен → без рекомпиляций в рантайме), ночью
+  SunCycle включает autoUpdate, орто-фрустум следует за камерой (`followCamera` + тексельный снап);
+- **SH6** LightManager: бюджет обновлений теневых карт — `shadowBudget` (грантов/кадр, round-robin по
+  времени ожидания; первый рендер карты — вне бюджета) и `shadowRate` (Гц на источник, default +
+  per-entry + `setShadowRate()`); статичные факелы больше не рендерят куб-карту каждый кадр;
+- **SH7** Пресеты: `SHADOW_QUALITY_PRESETS` (low/medium/high/ultra) + `applyShadowQuality(name,
+  {rig, sun, lights, directional})` — один вызов настраивает каскады, тапы, soft, размеры карт
+  и бюджет LightManager; 'high' = прежнее поведение v2.6;
+- **SH8** Отладка: `SunShadowHelper(sun)` — wireframe фрустумов каскадов (цвет на каскад) + линия
+  направления света; работает и при выключенном теневом проходе (сам зовёт updateMatrices);
+- **SH9** Инструменты: `tools/dev/` — GLSL-валидатор (glslang 16.6.0, 46 комбинаций: тип карты ×
+  каскады × тиры × soft × состав источников) и smoke-тесты логики (67 проверок, без WebGL):
+  `npm run shaders`, `npm run smoke`.
+
 ## v2.4 — исправления по итогам стресс-тестирования (метки T1..T16 в коде):
 
 - **T1** PhysicsWorld: options.recordContacts теперь читается конструктором;
