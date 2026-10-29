@@ -20,9 +20,8 @@
 | [`API.md`](API.md) | Полный справочник: 167 экспортов — 35 классов (опции конструкторов, методы, события), 37 функций, GLSL-чанки, пресеты |
 | [`QUICKSTART.md`](QUICKSTART.md) | Руководство по интеграции: подключение, рабочий минимум, открытый мир, физика, ввод/звук, частицы, оптимизация, чек-лист ошибок |
 | [`CHANGELOG.md`](CHANGELOG.md) | История изменений v2.4 → v2.8 с метками фиксов (T/F/R/S/L/N/M/SH/GK) |
-| [`../PLAN-gamekit.md`](../PLAN-gamekit.md) | План и статусы Gameplay Kit (v2.8) + разбор референс-скриншота |
-| [`../PLAN-shadows.md`](../PLAN-shadows.md) | План и статусы Shadow Overhaul (v2.7) |
-| [`../tools/dev/`](../tools/dev/) | Dev-стенд: GLSL-валидатор (`npm run shaders`) и smoke-тесты (`npm run smoke`) |
+| [`../PLAN-fixes.md`](../PLAN-fixes.md) | План и статусы v2.9 (горизонт, contact-AO, дневной режим) + разбор причин |
+| [`tools/dev/`](tools/dev/) | Dev-стенд: GLSL-валидатор (`npm run shaders`), smoke-тесты (`npm run smoke`, `npm run shadow`), headless-скриншоты демо (`npm run shot`) |
 
 ## Быстрый вход (для агента)
 
@@ -36,9 +35,21 @@
 > **v2.8 Gameplay Kit** — игровой набор: FP-контроллер, вьюмодель (кулак+меч), scatter-пропсы,
 > процедурные меч/кулак/цветок (+тип детали `flower`), парящие острова, stylized-материалы
 > (toon+rim), кино-грейд постобработки, DOM-HUD. Демо: `examples/sword-field.html`
-> (запуск `npm run serve`), тесты `npm run smoke` (166 проверок) и `npm run shaders` (49 GLSL).
-> Single-file вариант демо (открывается двойным кликом, без сервера):
-> `examples/sword-field-standalone.html`; пересборка — `npm run standalone`.
+> (запуск `npm run serve`); тесты: `npm run smoke` (база), `npm run game` (105 проверок),
+> `npm run shadow` (74), `npm run shaders` (49 GLSL).
+> Single-file вариант демо (открывается двойным кликом, без сервера) собирается
+> командой `npm run standalone` в `examples/sword-field-standalone.html`
+> (артефакт в git не кладётся).
+
+> **v2.9 Horizon & Contact-AO & Day fix** — три визуальных/рендерных фикса с полными
+> разборами в [PLAN-fixes.md](../PLAN-fixes.md): **H1** вуаль горизонта неба
+> (непрерывность тумана на силуэте, `SkyDome.bindFog`); **S1–S4** SSAO как контактная
+> подсветка стыков (квадратичный спад по дистанции окклюдера, плотные дефолты,
+> применение только к ambient-составляющей через `uAOAmbient`/`ao.lights`) — исчезли
+> «обволакивающие» ореолы вместо теней; **D2** дневной режим с CSM: shadow-map луны
+> существует с первого кадра (`needsUpdate`), иначе PCF/PCFSoft ловил
+> GL INVALID_OPERATION на всех draw освещаемых материалов. Демо восстановлено,
+> headless-скриншоты до/после — `npm run shot`, доказательства в `shots/`.
 
 > **Примечание v2.7:** в файл движка внесён Shadow Overhaul (метки SH1..SH9 в
 > CHANGELOG) — токен-поток больше не совпадает с оригиналом v2.6.0; проверка

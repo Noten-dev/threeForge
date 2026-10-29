@@ -396,7 +396,10 @@ const rig = createLightRig({
   scene, camera,
   moonShadow: { mapSize: 1024, range: 60 },  // castShadow включён сразу — без
 });                                          // рекомпиляций в рантайме
-// ночью SunCycle сам включает shadow-проход луны и следит фрустумом за камерой
+// ночью SunCycle сам включает shadow-проход луны и следит фрустумом за камерой.
+// v2.9 (D2): карта луны рендерится один раз на ПЕРВОМ кадре при любом времени
+// суток (needsUpdate=true из рига) — иначе днём sampler2DShadow в PCF/PCFSoft
+// получил бы плейсхолдер без COMPARE_MODE (GL INVALID_OPERATION на всех draw).
 ```
 
 ### Бюджет обновлений (много факелов/ламп)
@@ -444,7 +447,10 @@ rig.setTime(22.6);
 const post = new TF.PostPipeline({
   renderer, scene, camera, fog,
   bloom: { enabled: true, threshold: 1.05, intensity: 0.42 },
-  grade: { vignette: 0.34, saturation: 1.1, tint: 0xc9d2ff }
+  grade: { vignette: 0.34, saturation: 1.1, tint: 0xc9d2ff },
+  // v2.9 (S3): AO гасит только ambient-составляющую; доля берётся из живых
+  // интенсивностей рига (ночью выше, днём почти не трогает солнечный свет)
+  ao: { lights: { hemi: rig.hemi, sun: rig.sun, moon: rig.moon } }
 });
 post.attach(engine);
 

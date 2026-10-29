@@ -7,7 +7,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+// Корень репозитория: serve.mjs лежит в <root>/src/tools/dev (или <root>/tools/dev).
+// Поднимаемся на два уровня и, если попали в src/ (новая раскладка), ещё на один.
+let root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+if (path.basename(root) === 'src') root = path.resolve(root, '..');
 const port = Number(process.argv[2] || process.env.PORT || 8123);
 
 const MIME = {

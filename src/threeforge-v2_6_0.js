@@ -1935,7 +1935,14 @@ function createLightRig(options = {}) {
 		moon.shadow.radius = mo.radius !== undefined ? mo.radius : 1.6;
 		moon.shadow.intensity = 0;
 		moon.shadow.autoUpdate = false;
-		moon.shadow.needsUpdate = false;
+		// D2 (v2.9): карта луны обязана существовать с ПЕРВОГО кадра, даже днём:
+		// castShadow=true держит NUM_DIR_LIGHT_SHADOWS>0 (sampler2DShadow в PCF),
+		// а при shadow.map === null three биндит плейсхолдер без COMPARE_MODE →
+		// GL INVALID_OPERATION (1282) → ВСЕ draw-pass'ы материалов с тенями
+		// отбрасывались днём (кадр = одно небо). Однократный рендер карты на
+		// первом кадре (needsUpdate) чинит сэмплер; вклад тени днём = 0
+		// (shadow.intensity = 0), стоимость — один shadow-pass при старте.
+		moon.shadow.needsUpdate = true;
 		moonShadowCfg = {
 			range: mo.range !== undefined ? mo.range : 60,
 			distance: mo.distance !== undefined ? mo.distance : undefined
@@ -7411,8 +7418,15 @@ void main() {
 		sViewZ = tfAoPDToViewZ( sd );
 #endif
 		// семпл закрыт, если считанная геометрия БЛИЖЕ к камере (viewZ больше)
-		if ( sViewZ - S.z > uBias ) {
-			ao += smoothstep( 0.0, 1.0, uRangeCheck / max( 1e-4, abs( P.z - sViewZ ) ) );
+		float dv = sViewZ - S.z;
+		if ( dv > uBias ) {
+			// S1 (v2.9): контактная локализация. Вклад сэмпла гаснет квадратично
+			// по дистанции до окклюдера (view-глубина): остаётся только окклюзия
+			// «в стыке», метровые ореолы-«объятия» вокруг силуэтов исчезают.
+			// Прежний бинарный range-check оставляем внешним отсечением.
+			float od = abs( P.z - sViewZ );
+			float contact = 1.0 - smoothstep( uRadius * 0.25, uRadius, od );
+			ao += contact * contact * smoothstep( 0.0, 1.0, uRangeCheck / max( 1e-4, od ) );
 		}
 	}
 	float occ = clamp( ( ao / float( TF_AO_SAMPLES ) ) * uIntensity, 0.0, 1.0 );
@@ -7478,6 +7492,9 @@ uniform sampler2D tScene;
 #ifdef TF_COMP_AO
 uniform sampler2D tAO;
 uniform float uAOStrength;
+// S3 (v2.9): доля ambient в освещении кадра; AO гасит только её (прямой свет
+// светила остаётся нетронутым — тени даёт теневая карта, а не AO).
+uniform float uAOAmbient;
 #endif
 uniform sampler2D tBloom;        // 3.1d: HDR-ореол (¼ рез), добавляется до тонмаппинга
 uniform float uBloomIntensity;
@@ -7508,7 +7525,7 @@ void main() {
 	vec3 c = texture2D( tScene, vTfUv ).rgb;
 #ifdef TF_COMP_AO
 	float ao = texture2D( tAO, vTfUv ).r;
-	c *= mix( 1.0, ao, uAOStrength );
+	c *= mix( 1.0, ao, uAOStrength * uAOAmbient );
 #endif
 	c += texture2D( tBloom, vTfUv ).rgb * uBloomIntensity;
 	gl_FragColor = vec4( tfTonemap( c ), 1.0 );
@@ -7948,14 +7965,21 @@ const PostPipeline = class extends THREE.EventDispatcher {
 			enabled: true,
 			samples: 16,
 			resolutionScale: 0.5,
-			radius: 0.8,
-			bias: 0.025,
-			rangeCheck: 2.0,
-			intensity: 1.7,
-			power: 1.35,
+			// S2 (v2.9): контактные дефолты — AO это подсветка стыков, а не замена
+			// теней: радиус порядка десятков см, умеренная интенсивность.
+			radius: 0.5,
+			bias: 0.03,
+			rangeCheck: 1.0,
+			intensity: 1.15,
+			power: 1.6,
 			fadeEnd: 0,
 			strength: 1.0,
-			blurSharpness: 4.0
+			blurSharpness: 4.0,
+			// S3 (v2.9): доля ambient-составляющей, к которой применимо AO.
+			// При lights = {hemi, sun, moon} считается каждый кадр из живых
+			// интенсивностей; иначе — эта константа.
+			ambientShare: 0.6,
+			lights: null
 		}, options.ao || {});
 
 		this.debug = options.debug || 'none';
@@ -8052,6 +8076,7 @@ const PostPipeline = class extends THREE.EventDispatcher {
 				tScene: { value: null },
 				tAO: { value: null },
 				uAOStrength: { value: this.aoOptions.strength },
+				uAOAmbient: { value: this.aoOptions.ambientShare !== undefined ? this.aoOptions.ambientShare : 0.6 },
 				tBloom: { value: null },
 				uBloomIntensity: { value: 0 },
 				uDither: { value: 1 }
@@ -8437,6 +8462,12 @@ const PostPipeline = class extends THREE.EventDispatcher {
 		if (params.rangeCheck !== undefined) u.uRangeCheck.value = o.rangeCheck || o.radius * 2.5;
 		if (params.blurSharpness !== undefined) this.blurMat.uniforms.uSharpness.value = o.blurSharpness;
 		if (params.strength !== undefined) this.compositeMat.uniforms.uAOStrength.value = o.strength;
+		// S3 (v2.9): ambient-доля и привязка источников; фактическое значение
+		// uniform uAOAmbient пересчитывается каждый кадр в _updateAOAmbient()
+		if (params.ambientShare !== undefined) {
+			o.ambientShare = Math.max(0, Math.min(1, Number(params.ambientShare) || 0));
+		}
+		if (params.lights !== undefined) o.lights = params.lights === false ? null : params.lights;
 		if (params.enabled !== undefined) {
 			const on = o.enabled === true;
 			if (on) this.compositeMat.defines.TF_COMP_AO = '';
@@ -8678,6 +8709,7 @@ const PostPipeline = class extends THREE.EventDispatcher {
 
 		if (aoOn) {
 			t0 = this.profile ? _tfNow() : 0;
+			this._updateAOAmbient();          // S3: доля ambient для композита
 			this._updateCameraUniforms(taaOn);
 			const useNormals = this.quality === 'high';
 			this.aoMat.uniforms.tDepth.value = this.sceneRT.depthTexture;
@@ -8895,6 +8927,27 @@ const PostPipeline = class extends THREE.EventDispatcher {
 		} else if (this.rtPost.width !== this._w || this.rtPost.height !== this._h) {
 			this.rtPost.setSize(this._w, this._h);
 		}
+	}
+
+	/**
+	 * S3 (v2.9): доля ambient-составляющей в освещении кадра — композит гасит
+	 * AO только её (uniform uAOAmbient). При `aoOptions.lights = {hemi, sun, moon}`
+	 * берётся из живых интенсивностей источников каждый кадр; иначе —
+	 * `aoOptions.ambientShare`. Физика: AO — это окклюзия НЕБЕСНОГО света,
+	 * прямой свет светила редактирует теневая карта, а не AO.
+	 */
+	_updateAOAmbient() {
+		const o = this.aoOptions;
+		let share = o.ambientShare !== undefined ? o.ambientShare : 0.6;
+		const L = o.lights;
+		if (L !== null && L !== undefined) {
+			const hemi = L.hemi !== undefined && L.hemi !== null ? Math.max(0, L.hemi.intensity || 0) : 0;
+			const sun = L.sun !== undefined && L.sun !== null ? Math.max(0, L.sun.intensity || 0) : 0;
+			const moon = L.moon !== undefined && L.moon !== null ? Math.max(0, L.moon.intensity || 0) : 0;
+			const total = hemi + sun + moon;
+			if (total > 1e-4) share = hemi / total;
+		}
+		this.compositeMat.uniforms.uAOAmbient.value = Math.max(0.15, Math.min(0.85, share));
 	}
 
 	_updateCameraUniforms(jittered = false) {
@@ -12816,6 +12869,10 @@ uniform float uNightFactor;
 // --- контракт FogManager (часть 1.75, _commit): количество + общий цвет ---
 uniform float uSkyFogAmt;
 uniform vec3 tfFogColor;
+// --- H1 (v2.9): горизонтальная вуаль: полоса у горизонта сходится к tfFogColor
+// --- независимо от uSkyFogAmt (см. секцию 7) ---
+uniform float uHorizonVeil;
+uniform float uVeilHeight;
 // --- контракт WeatherManager (часть 1.9, _updateLightning) ---
 uniform float uFlash;
 uniform vec3 uFlashColor;
@@ -12960,6 +13017,15 @@ void main() {
 	// ни горизонта, ни светил (celFade) не прорисовывается.
 	float hMask = 1.0 - smoothstep( -0.06, 0.5, up );
 	float fogMask = clamp( amt * ( hMask * 1.25 + 0.35 ) + pow( amt, 4.0 ), 0.0, 1.0 );
+	// H1 (v2.9): горизонтальная вуаль. Террейн у горизонта затуманен ДО КОНЦА
+	// (linear/exp2-фог на бесконечности = 1) и равен tfFogColor в sRGB-конвенции;
+	// без вуали его силуэт жёстко обрезается о цвет неба (ночью skyFog ≈ 0 —
+	// разрыв максимален). Вуаль = 1 чуть ниже горизонта и плавно (квадратично)
+	// сходит к 0 к uVeilHeight: непрерывность C0 на линии силуэта при любом
+	// uSkyFogAmt. Звёзды/закат в полосе вуали приглушаются — физично (экстинкция).
+	float veil = uHorizonVeil * ( 1.0 - smoothstep( -0.02, uVeilHeight, up ) );
+	veil *= veil;
+	fogMask = clamp( max( fogMask, veil ), 0.0, 1.0 );
 	gl_FragColor.rgb = mix( gl_FragColor.rgb, tfFogColor, fogMask );
 }
 `;
@@ -12989,6 +13055,9 @@ const SkyDome = class extends Mesh {
 	 *   starColorMix (0.55).
 	 * Небо: gradientStart (-0.05), gradientEnd (0.55), sunsetGlow (0.9),
 	 *   belowDarken (0.32), flashColor (0xdfe9ff).
+	 * Вуаль горизонта (H1, v2.9): horizonVeil (1) — сила сведения неба к цвету
+	 *   тумана у горизонта (применяется bindFog), veilHeight (0.3) — высота
+	 *   полосы по dir.y; непрерывность затуманенного террейна на силуэте.
 	 */
 	constructor(options = {}) {
 		const radius = options.radius !== undefined ? options.radius : 2400;
@@ -13003,6 +13072,9 @@ const SkyDome = class extends Mesh {
 			uSunIntensity: { value: 3.3 },
 			uNightFactor: { value: 0 },
 			uSkyFogAmt: { value: 0 },
+			// H1 (v2.9): горизонтальная вуаль (0, пока не привязан FogManager)
+			uHorizonVeil: { value: 0 },
+			uVeilHeight: { value: options.veilHeight !== undefined ? options.veilHeight : 0.3 },
 			tfFogColor: { value: new Color(0.62, 0.75, 0.87) },
 			uFlash: { value: 0 },
 			uFlashColor: { value: new Color(options.flashColor !== undefined ? options.flashColor : 0xdfe9ff) },
@@ -13056,6 +13128,8 @@ const SkyDome = class extends Mesh {
 		this.timeScale = options.timeScale !== undefined ? options.timeScale : 1;
 		this.follow = options.follow !== undefined ? options.follow : null;
 		this.autoScale = options.autoScale !== false;
+		// H1 (v2.9): сила горизонтальной вуали (применяется bindFog)
+		this.horizonVeil = options.horizonVeil !== undefined ? options.horizonVeil : 1;
 
 		this._sunCycle = null;
 		this._fog = null;
@@ -13116,6 +13190,8 @@ const SkyDome = class extends Mesh {
 		fog.skyRadius = this.radius;
 		fog.skyUniforms = this.uniforms;
 		this.uniforms.tfFogColor.value = fog.uniforms.tfFogColor.value;
+		// H1 (v2.9): включаем горизонтальную вуаль — непрерывность тумана на силуэте
+		this.uniforms.uHorizonVeil.value = this.horizonVeil;
 		return this;
 	}
 
@@ -13132,6 +13208,7 @@ const SkyDome = class extends Mesh {
 		this._fog = null;
 		this._fogPrev = null;
 		this.uniforms.tfFogColor.value = this._neutralFogColor;
+		this.uniforms.uHorizonVeil.value = 0;   // H1: без FogManager вуали нет
 		return this;
 	}
 

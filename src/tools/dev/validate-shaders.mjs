@@ -62,7 +62,7 @@ export function validateFragment(label, glsl) {
 
 // ------------------------------------------------------------------ драйвер
 async function main() {
-	const TF = await import('../../src/threeforge-v2_6_0.js');
+	const TF = await import('../../threeforge-v2_6_0.js');
 	const THREE = await import('three');
 
 	// 0. Sanity: чистый physical-шейдер three с тенями (без патчей движка)

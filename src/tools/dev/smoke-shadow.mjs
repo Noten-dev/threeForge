@@ -5,7 +5,7 @@
 import * as THREE from 'three';
 import { SunLightShadow as RefSunLightShadow } from 'three/addons/lights/SunLightShadow.js';
 
-const TF = await import('../../src/threeforge-v2_6_0.js');
+const TF = await import('../../threeforge-v2_6_0.js');
 
 let failures = 0;
 let checks = 0;
@@ -291,6 +291,36 @@ section('applyShadowQuality + SunShadowHelper');
 	TF.setSunCascadeCount(2);
 	rig.dispose();
 	lights.dispose();
+	scene.clear();
+}
+
+// ------------------------------------------------- D2 (v2.9): лунная карта днём
+section('D2: shadow.map луны существует с первого кадра (день/ночь)');
+{
+	const scene = new THREE.Scene();
+	const cam = new THREE.PerspectiveCamera(60, 1, 0.1, 500);
+	cam.position.set(0, 2, 0);
+	const rig = TF.createLightRig({ scene, camera: cam, moonShadow: { mapSize: 256, range: 40 } });
+
+	// полдень: проход луны выключен, но карта обязана быть запрошена к рендеру
+	rig.setTime(12);
+	rig.update(0);
+	ok(rig.moon.castShadow === true, 'D2: луна — shadow-caster');
+	ok(rig.moon.shadow.autoUpdate === false, 'D2: днём autoUpdate выключен');
+	ok(rig.moon.shadow.needsUpdate === true, 'D2: днём needsUpdate=true (карта отрисуется первым кадром)');
+	ok(rig.moon.shadow.intensity === 0, 'D2: днём вклад лунной тени = 0');
+
+	// ночь: проход включается штатно
+	rig.setTime(23);
+	rig.update(0);
+	ok(rig.moon.shadow.autoUpdate === true, 'D2: ночью autoUpdate включён');
+	ok(rig.moon.shadow.intensity > 0.5, 'D2: ночью интенсивность лунной тени > 0.5');
+
+	// SunCycle днём не сбрасывает needsUpdate (иначе карта не родится)
+	rig.setTime(12);
+	rig.update(0);
+	ok(rig.moon.shadow.needsUpdate === true, 'D2: SunCycle не сбрасывает needsUpdate днём');
+	rig.dispose();
 	scene.clear();
 }
 

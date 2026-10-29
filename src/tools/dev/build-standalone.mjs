@@ -11,7 +11,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse } from 'acorn';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+// Корень репозитория: скрипт лежит в <root>/src/tools/dev (или <root>/tools/dev).
+let root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+if (path.basename(root) === 'src') root = path.resolve(root, '..');
 const read = (p) => fs.readFileSync(path.join(root, p), 'utf-8');
 
 // --------------------------------------------------------------- парсер export-блоков

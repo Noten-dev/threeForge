@@ -4,7 +4,7 @@
  */
 import * as THREE from 'three';
 
-const TF = await import('../../src/threeforge-v2_6_0.js');
+const TF = await import('../../threeforge-v2_6_0.js');
 
 let failures = 0;
 let checks = 0;

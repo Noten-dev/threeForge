@@ -1,4 +1,4 @@
-const m = await import('../src/threeforge-v2_6_0.js');
+const m = await import('../threeforge-v2_6_0.js');
 const keys = Object.keys(m);
 console.log('import OK; exports:', keys.length);
 // базовые smoke-проверки без DOM/WebGL

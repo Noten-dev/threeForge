@@ -8,6 +8,47 @@
 `threeforge-engine.js` (части 1–2: ядро и игровой мир) и `threeforge-advanced.js` (часть 3: продвинутый
 рендеринг и оптимизация). Все системы опциональны; имена экспортов не менялись между версиями.
 
+## v2.9 — Horizon & Contact-AO & Day fix (H1, S1–S4, D1–D3):
+
+- **H1** `TF_SKY_FRAG` / `SkyDome`: **горизонтальная вуаль** — полоса неба вокруг
+  горизонта сходится к цвету тумана `tfFogColor` НЕЗАВИСИМО от `uSkyFogAmt`
+  (маска `max(fogMask, veil)`, veil = 1 ниже горизонта, квадратично гаснет к
+  `uVeilHeight`). Устраняет жёсткий «обрез» тумана силуэтом горизонта: террейн вдали
+  всегда полностью затуманен, а небо ночью (`skyFog ≈ 0`) раньше оставалось своим —
+  разрыв цветов на линии силуэта. Новые униформы `uHorizonVeil`/`uVeilHeight`;
+  опции `SkyDome({ horizonVeil = 1, veilHeight = 0.3 })`; вуаль включает
+  `bindFog()`, выключает `unbindFog()`. Звёзды/закат в полосе вуали приглушаются
+  (атмосферная экстинкция).
+- **S1** `TF_AO_FRAG`: **контактная локализация SSAO** — вклад сэмпла гаснет
+  квадратично по дистанции до окклюдера (`contact = 1 - smoothstep(0.25·R, R, od)`);
+  метровые ореолы-«объятия» вокруг силуэтов и градиенты на вертикалях у земли
+  исчезают, остаётся подсветка стыков.
+- **S2** дефолты AO: `radius 0.8→0.5`, `bias 0.025→0.03`, `rangeCheck 2.0→1.0`,
+  `intensity 1.7→1.15`, `power 1.35→1.6`.
+- **S3** `TF_COMPOSITE_FRAG` / `PostPipeline`: AO применяется только к **ambient**-
+  составляющей освещения (новый uniform `uAOAmbient`): доля берётся из живых
+  интенсивностей `ao.lights = {hemi, sun, moon}` (`share = hemi/(hemi+sun+moon)`,
+  кламп 0.15..0.85, пересчёт каждый кадр в `_updateAOAmbient()`), без привязки —
+  `aoOptions.ambientShare` (дефолт 0.6). Прямой свет светила больше не гасится AO:
+  «тень» перестаёт обволакивать предмет, брошенные тени даёт теневая карта.
+  `setAO({ambientShare, lights})`.
+- **D1** dev-стенд: `serve.mjs` отдаёт корень репозитория (раскладка `src/`),
+  починены относительные импорты `smoke.mjs`/`smoke-game.mjs`/`smoke-shadow.mjs`/
+  `validate-shaders.mjs`; восстановлено демо `examples/sword-field.html` +
+  headless-скриншоты `npm run shot` (playwright + SwiftShader).
+- **D2** `createLightRig({moonShadow})`: **дневной режим восстановлен**. Корень бага:
+  `castShadow=true` у луны держит `NUM_DIR_LIGHT_SHADOWS > 0` (`sampler2DShadow` в
+  PCF/PCFSoft), а днём shadow-pass луны выключен и `shadow.map === null` → three
+  биндит плейсхолдер без `COMPARE_MODE` → GL `INVALID_OPERATION` (1282) на каждом
+  draw → все освещаемые материалы отбрасывались (кадр = одно небо; `BasicShadowMap`
+  не требовал compare — потому работал). Фикс: `moon.shadow.needsUpdate = true` при
+  создании рига — карта рендерится один раз на первом кадре при любом времени суток
+  (вклад днём = 0 через `shadow.intensity`), сэмплер валиден, рекомпиляций нет.
+  Regression-тест в `smoke-shadow.mjs` (D2, 7 проверок).
+- **D3** dev-стенд: `build-standalone.mjs` — корень репозитория (раскладка `src/`),
+  `npm run standalone` собран и проверен headless- прогоном; артефакт
+  `examples/sword-field-standalone.html` в git не кладётся (`.gitignore`).
+
 ## v2.8 — Gameplay Kit (игровой набор; аддитивно, дефолты = v2.7):
 
 - **GK1** `createSwordGeometry` — процедурный низполи-меч (4-гранный клинок с остриём и

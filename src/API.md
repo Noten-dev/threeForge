@@ -710,6 +710,11 @@ createLightRig — готовый риг дневного цикла.
   castShadow включается СРАЗУ (NUM_DIR_LIGHT_SHADOWS стабилен → без
   рекомпиляций в рантайме); ночью SunCycle включает autoUpdate и
   followCamera(range) вокруг камеры, днём проход теней не рендерится.
+  v2.9 (D2): при включённом moonShadow риг ставит `moon.shadow.needsUpdate =
+  true` — карта луны рендерится один раз на первом кадре при любом времени
+  суток; без неё днём `shadow.map === null`, и sampler2DShadow в PCF/PCFSoft
+  получал плейсхолдер без COMPARE_MODE (GL INVALID_OPERATION 1282 → все draw
+  освещаемых материалов отбрасывались, кадр = одно небо).
 @returns {{group, sun, hemi, moon, cycle, setTime, update, bindShadowCamera, dispose}}
 ```
 
@@ -1321,7 +1326,7 @@ fbm — фрактальный шум (сумма октав с нормиров
 | `taa` | `{}` | motion vectors для trackObject() |
 | `godRays` | `{}` | — |
 | `bloom` | `{}` | 1\|2 прохода блюра (2 |
-| `ao` | `{}` | 1/порог глубины билатерального блюра |
+| `ao` | `{}` | SSAO: `{enabled, samples, resolutionScale, radius, bias, rangeCheck, intensity, power, fadeEnd, strength, blurSharpness, ambientShare, lights}`. v2.9: дефолты контактные (`radius 0.5, bias 0.03, rangeCheck 1.0, intensity 1.15, power 1.6`); `lights = {hemi, sun, moon}` — живые источники для доли ambient (см. ниже); `ambientShare` (0.6) — доля без привязки. |
 | `debug` | `'none'` | 'none' \| 'ao' \| 'depth' \| 'normals' |
 | `profile` | `false` | — |
 | `hdr` | `false` | — |
@@ -1356,6 +1361,15 @@ fbm — фрактальный шум (сумма октав с нормиров
 | `dispose()` |  |
 
 *Приватные (`_…`, не часть публичного контракта): 7 — `_ensureLdr`, `_fxaaActive`, `_finalBlit`, `_ensurePost`, `_updateCameraUniforms`, `_hideForPrepass`, `_restoreAfterPrepass`*
+
+**AO v2.9 (S1–S3).** SSAO — подсветка контактных стыков, а не замена теней:
+вклад сэмпла гаснет квадратично по дистанции до окклюдера (метровые ореолы вокруг
+силуэтов устранены), а в композите AO умножается только на ambient-составляющую
+освещения (`uAOAmbient`): при `ao.lights = {hemi, sun, moon}` доля считается каждый
+кадр как `hemi/(hemi+sun+moon)` (кламп 0.15..0.85) — прямой свет светила и его
+теневая карта не гасятся AO. Без привязки источников действует константа
+`aoOptions.ambientShare` (0.6). `setAO({…, ambientShare, lights})`; `lights: false`
+снимает привязку.
 
 **События** (`EventDispatcher`): `quality`, `godrays`
 
@@ -1992,6 +2006,8 @@ SkyDome — купол неба (система Engine: update(dt); меш дл�
 | `gradientEnd` | `0.55` | — |
 | `sunsetGlow` | `0.9` | — |
 | `belowDarken` | `0.32` | — |
+| `horizonVeil` | `1` | v2.9 (H1): сила горизонтальной вуали — сведения неба к цвету тумана у горизонта (непрерывность тумана на силуэте); применяется при `bindFog()`, `0` — вуаль выключена. |
+| `veilHeight` | `0.3` | v2.9 (H1): высота полосы вуали по `dir.y` (0.3 ≈ 17° над горизонтом). |
 | `renderOrder` | `10` | — |
 | `timeScale` | `1` | — |
 | `follow` | `null` | — |
